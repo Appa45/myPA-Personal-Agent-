@@ -1,11 +1,16 @@
 import os
 import sys
 from pathlib import Path
+from fastapi import FastAPI,HTTPException
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+
+
+app = FastAPI(title="AURA Assistant API")
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -14,7 +19,8 @@ sys.path.insert(0, str(BASE_DIR))
 import assistant as core  # noqa: E402
 from location_service import get_location  # noqa: E402
 
-app = FastAPI(title="AURA Assistant API", version="1.0.0")
+
+
 origins = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
 app.add_middleware(
     CORSMiddleware,
