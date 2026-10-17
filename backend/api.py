@@ -28,11 +28,11 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=1500)
 
 
-@app.get("/health")
+@app.get("/api/health")
 def health():
     return {"ok": True, "configured": bool(os.getenv("GROQ_API_KEY"))}
 
-@app.post("/chat")
+@app.post("/api/chat")
 def chat(payload: ChatRequest):
     if not os.getenv("GROQ_API_KEY"):
         raise HTTPException(status_code=503, detail="GROQ_API_KEY is missing. Add it to backend/.env and restart the server.")
@@ -41,7 +41,7 @@ def chat(payload: ChatRequest):
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Assistant request failed: {type(exc).__name__}: {exc}") from exc
 
-@app.get("/location")
+@app.get("/api/location")
 def location():
     result = get_location()
     if not result.get("success"):

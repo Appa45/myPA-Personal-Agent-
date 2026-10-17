@@ -17,7 +17,9 @@ import {
   VolumeX,
 } from "lucide-react";
 
-const API_BASE = import.meta.env.VITE_API_URL || "";
+const API_BASE =
+  import.meta.env.VITE_API_URL ||
+  (import.meta.env.DEV ? "http://127.0.0.1:8000" : "");
 
 const initialMessages = [
   {
@@ -321,39 +323,59 @@ async function sendMessage(text = input) {
   try {
     logTime("Sending POST /api/chat");
 
-    const response = await fetch(`${API_BASE}/api/chat`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ message }),
-    });
+  
+const response = await fetch(`${API_BASE}/api/chat`, {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  },
+  body: JSON.stringify({ message }),
+});
 
-    logTime(`HTTP response received (${response.status})`);
+logTime(`HTTP response received (${response.status})`);
 
-    const data = await response.json();
+// Read the response body only once.
+const responseText = await response.text();
 
-    logTime("Response JSON parsed");
+let data = {};
 
-    if (!response.ok) {
-      throw new Error(
-        data.detail || "The assistant request failed."
-      );
-    }
+if (responseText.trim()) {
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      `Server returned invalid JSON (HTTP ${response.status}): ` +
+      responseText.slice(0, 300)
+    );
+  }
+}
 
-    const reply = data.reply || "I received an empty response.";
+logTime("Response parsed");
 
-    setMessages((previous) => [
-      ...previous,
-      { role: "assistant", content: reply },
-    ]);
+if (!response.ok) {
+  throw new Error(
+    data.detail ||
+    data.error ||
+    `Request failed with HTTP ${response.status}`
+  );
+}
 
-    logTime("Assistant reply displayed");
+const reply = data.reply;
 
-    setStatus("Ready when you are");
+if (typeof reply !== "string" || !reply.trim()) {
+  throw new Error("The backend returned no assistant reply.");
+}
 
-    // Speak only after the actual reply has arrived.
-    say(reply);
+setMessages((previous) => [
+  ...previous,
+  { role: "assistant", content: reply },
+]);
+
+setStatus("Ready when you are");
+say(reply);
+
+    
     logTime("Speech playback requested");
   } catch (error) {
     logTime("Request failed");
