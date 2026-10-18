@@ -6,6 +6,7 @@ Run: python assistant.py
 Text mode: python assistant.py --text
 """
 import argparse, email, imaplib, io, json, os, re, sys, tempfile, time, traceback
+from email_service import send_email
 from datetime import datetime
 from email.header import decode_header, make_header
 from html import unescape
@@ -145,7 +146,7 @@ def read_emails(count=5, unread_only=True, sender=""):
 
 from location_service import get_location
 
-TOOL_FUNCS = {"get_news": get_news, "read_emails": read_emails, "get_location": get_location}
+TOOL_FUNCS = {"get_news": get_news, "read_emails": read_emails, "send_email": send_email,"get_location": get_location}
 
 # Every function tool must have a non-empty name and an object parameters schema.
 TOOLS = [
@@ -178,23 +179,66 @@ TOOLS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_emails",
-            "description": "Read recent Gmail messages. Read-only; never sends or modifies email.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "count": {"type": "integer", "description": "Number of emails, 1 to 3"},
-                    "unread_only": {"type": "boolean", "description": "Only unread emails when true"},
-                    "sender": {"type": "string", "description": "Optional sender filter"},
+ {
+    "type": "function",
+    "function": {
+        "name": "read_emails",
+        "description": (
+            "Read recent Gmail messages. Use this tool to retrieve emails "
+            "and summarize their sender, subject, and content. "
+            "This tool is read-only and must never send, delete, or modify emails."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "description": "Number of emails to retrieve, from 1 to 3"
                 },
-                "required": [],
-                "additionalProperties": False,
+                "unread_only": {
+                    "type": "boolean",
+                    "description": "Return only unread emails when true"
+                },
+                "sender": {
+                    "type": "string",
+                    "description": "Optional sender name or email address filter"
+                }
             },
-        },
-    },
+            "required": [],
+            "additionalProperties": False
+        }
+    }
+},
+{
+    "type": "function",
+    "function": {
+        "name": "send_email",
+        "description": (
+            "Send an email using the connected Gmail account. "
+            "Use only when the user explicitly requests sending an email. "
+            "Do not use this tool to create drafts or merely suggest replies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "to_email": {
+                    "type": "string",
+                    "description": "Recipient's email address"
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "Subject of the email"
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Complete plain-text email message"
+                }
+            },
+            "required": ["to_email", "subject", "body"],
+            "additionalProperties": False
+        }
+    }
+}
 ]
 
 # Fail locally with a clear message rather than sending malformed tools to Groq.

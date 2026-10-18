@@ -6,8 +6,9 @@ from fastapi import FastAPI,HTTPException
 from dotenv import load_dotenv
 
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from email_service import send_email
 
 
 app = FastAPI(title="AURA Assistant API")
@@ -18,6 +19,31 @@ sys.path.insert(0, str(BASE_DIR))
 
 import assistant as core  # noqa: E402
 from location_service import get_location  # noqa: E402
+
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class EmailRequest(BaseModel):
+    to: str = Field(min_length=3, max_length=254)
+    subject: str = Field(min_length=1, max_length=200)
+    body: str = Field(min_length=1, max_length=10000)
+
+    @field_validator("to")
+    @classmethod
+    def validate_recipient(cls, value: str) -> str:
+        value = value.strip()
+
+        if value.count("@") != 1 or any(c.isspace() for c in value):
+            raise ValueError("Enter a valid recipient email address.")
+
+        local, _, domain = value.partition("@")
+
+        if not local or "." not in domain or domain.startswith(".") or domain.endswith("."):
+            raise ValueError("Enter a valid recipient email address.")
+
+        return value
+
 
 
 
@@ -53,3 +79,28 @@ def location():
     if not result.get("success"):
         raise HTTPException(status_code=502, detail=result.get("error", "Location lookup failed"))
     return result
+
+
+
+
+
+@app.post("/api/email/send")
+def send_email_endpoint(payload: EmailRequest):
+    try:
+        result = send_email(
+            to_email=payload.to,
+            subject=payload.subject,
+            body=payload.body,
+        )
+        return result
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    except Exception:
+        logging.exception("Email sending failed")
+        raise HTTPException(
+            status_code=502,
+            detail="Email could not be sent. Check the backend email configuration and logs.",
+        )
+
