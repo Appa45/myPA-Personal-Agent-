@@ -1,8 +1,9 @@
-
 import React, { useEffect, useRef, useState } from "react";
 import {
   Activity,
+  AlarmClock,
   AudioLines,
+  Bell,
   Bot,
   Compass,
   ExternalLink,
@@ -17,6 +18,11 @@ import {
   VolumeX,
 } from "lucide-react";
 
+import NotificationSettings from "./components/NotificationSettings";
+import RemindersManager from "./components/RemindersManager";
+import { enableNotifications } from "./firebase";
+// import Testtoken from "./TokenTest"
+
 const API_BASE =
   import.meta.env.VITE_API_URL ||
   (import.meta.env.DEV ? "http://127.0.0.1:8000" : "");
@@ -29,6 +35,25 @@ const initialMessages = [
   },
 ];
 
+const REMINDER_SEEN_KEY = "aura_seen_reminder_event";
+
+// FastAPI returns `detail` as a string for HTTP errors but as a list of objects
+// for 422 validation errors; turn either into readable text.
+function formatApiError(data, fallback) {
+  const detail = data?.detail ?? data?.error;
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail) && detail.length) {
+    return detail
+      .map((item) => {
+        const field = Array.isArray(item?.loc) ? item.loc.slice(1).join(".") : "";
+        return field ? `${field}: ${item?.msg || "invalid"}` : item?.msg || JSON.stringify(item);
+      })
+      .join("; ");
+  }
+  if (detail && typeof detail === "object") return JSON.stringify(detail);
+  return fallback;
+}
+
 export default function App() {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
@@ -40,7 +65,20 @@ export default function App() {
   const [locationLoading, setLocationLoading] = useState(false);
   const [status, setStatus] = useState("Ready when you are");
   const [voiceMode, setVoiceMode] = useState(false);
+  const [reminderDraft, setReminderDraft] = useState(null);
+  const [reminderBusy, setReminderBusy] = useState(false);
+  const [reminderNotice, setReminderNotice] = useState("");
   const voiceModeRef = useRef(false);
+  // Ref mirrors reminderDraft so voice callbacks (created once) never see stale state.
+  const reminderDraftRef = useRef(null);
+  const [reminderAlert, setReminderAlert] = useState(null);
+  const [firedReminders, setFiredReminders] = useState([]); // newest first
+  const [seenEventId, setSeenEventId] = useState(0);
+  const [showReminderPanel, setShowReminderPanel] = useState(false);
+  const lastEventIdRef = useRef(0);
+  const [showReminders, setShowReminders] = useState(false);
+  const [reminderListVersion, setReminderListVersion] = useState(0);
+  const sayRef = useRef(null);
 
   const bottomRef = useRef(null);
   const recognitionRef = useRef(null);
@@ -110,6 +148,104 @@ export default function App() {
     };
   }, []);
 
+  // Load every reminder that has fired, then watch for new ones.
+  useEffect(() => {
+    let cancelled = false;
+    let initialised = false;
+
+    async function pollFiredReminders() {
+      try {
+        const response = await fetch(
+          `${API_BASE}/api/reminders/events?after_id=${lastEventIdRef.current}&limit=200`
+        );
+        if (!response.ok || cancelled) return;
+        const data = await response.json();
+        const events = data.events || [];
+
+        // First successful load: show history silently, don't re-announce old reminders.
+        if (!initialised) {
+          initialised = true;
+          let stored = null;
+          try {
+            stored = window.localStorage.getItem(REMINDER_SEEN_KEY);
+          } catch {
+            // Storage may be unavailable.
+          }
+          setSeenEventId(stored === null ? data.latest_id || 0 : Number(stored) || 0);
+          lastEventIdRef.current = data.latest_id || 0;
+          setFiredReminders([...events].reverse());
+          return;
+        }
+
+        if (!events.length) return;
+        lastEventIdRef.current = data.latest_id;
+        setReminderListVersion((v) => v + 1);
+        setFiredReminders((previous) => [...[...events].reverse(), ...previous]);
+
+        setMessages((previous) => [
+          ...previous,
+          ...events.map((event) => ({
+            role: "assistant",
+            content: `⏰ Reminder: ${event.title}`,
+          })),
+        ]);
+
+        const last = events[events.length - 1];
+        setReminderAlert({ title: last.title, firedAt: last.fired_at });
+        setStatus(`Reminder: ${last.title}`);
+        sayRef.current?.(
+          events.length === 1
+            ? `Reminder: ${last.title}`
+            : `You have ${events.length} reminders: ${events.map((e) => e.title).join(", ")}`
+        );
+
+        // One native pop-up per reminder while the tab is visible
+        // (Firebase pushes cover the case where the tab is in the background).
+        try {
+          if (
+            "Notification" in window &&
+            Notification.permission === "granted" &&
+            document.visibilityState === "visible"
+          ) {
+            events.forEach((event) => {
+              new Notification("⏰ AURA Reminder", {
+                body: event.title,
+                icon: "/favicon.ico",
+                tag: `aura-reminder-${event.id}`,
+                requireInteraction: true,
+              });
+            });
+          }
+        } catch (error) {
+          console.debug("Local notification failed:", error);
+        }
+      } catch (error) {
+        console.debug("Reminder poll failed:", error);
+      }
+    }
+
+    pollFiredReminders();
+    const timer = window.setInterval(pollFiredReminders, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  // Mark reminders as read while the notification panel is open.
+  useEffect(() => {
+    if (!showReminderPanel || !firedReminders.length) return;
+    const newest = Math.max(...firedReminders.map((event) => event.id));
+    if (newest > seenEventId) {
+      setSeenEventId(newest);
+      try {
+        window.localStorage.setItem(REMINDER_SEEN_KEY, String(newest));
+      } catch {
+        // ignore
+      }
+    }
+  }, [showReminderPanel, firedReminders, seenEventId]);
+
   // Scroll to the newest conversation message.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({
@@ -163,6 +299,8 @@ function say(text) {
 
   window.speechSynthesis.speak(utterance);
 }
+
+sayRef.current = say;
 
 function startListening() {
   const SpeechRecognition =
@@ -289,6 +427,163 @@ function toggleMic() {
 }
 
 
+function sendTestNotification() {
+  if (!("Notification" in window)) {
+    return {
+      success: false,
+      message: "This browser does not support notifications.",
+    };
+  }
+
+  if (Notification.permission !== "granted") {
+    return {
+      success: false,
+      message:
+        "Notifications are not enabled yet. Click Enable Push Notifications in the sidebar first.",
+    };
+  }
+
+  try {
+    new Notification("AURA Test Notification", {
+      body: "Your voice assistant notification test is working!",
+      icon: "/favicon.ico",
+    });
+
+    return {
+      success: true,
+      message:
+        "I've triggered a test notification. Check your device. This is a local browser notification, not yet a Firebase push.",
+    };
+  } catch (error) {
+    console.error("Could not show test notification:", error);
+    return {
+      success: false,
+      message: "I couldn't display the test notification.",
+    };
+  }
+}
+
+  function updateReminderDraft(draft) {
+    reminderDraftRef.current = draft;
+    setReminderDraft(draft);
+  }
+
+  // Parse a natural-language reminder using the backend, then ask the user to confirm it.
+  async function prepareVoiceReminder(command) {
+    setReminderBusy(true);
+    setReminderNotice("");
+
+    try {
+      const token = await enableNotifications();
+      const response = await fetch(`${API_BASE}/api/reminders/voice/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          text: command, // accepted by every backend version
+          command,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",
+          token,
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(formatApiError(data, "Could not understand the reminder. Check the backend reminder preview endpoint."));
+      }
+
+      if (data.success === false) {
+        throw new Error(data.error || "I couldn't understand that reminder.");
+      }
+
+      if (!data.title || !data.due_at) {
+        throw new Error("The backend did not return a reminder title and due_at date/time.");
+      }
+
+      const draft = { ...data, token, command };
+      updateReminderDraft(draft);
+      const dueText = new Date(data.due_at).toLocaleString("en-IN", {
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",
+        dateStyle: "medium",
+        timeStyle: "short",
+      });
+      const confirmation = `I understood: ${data.title}, scheduled for ${dueText}. Please confirm it below.`;
+      setReminderNotice(confirmation);
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", content: confirmation },
+      ]);
+      setStatus("Waiting for reminder confirmation");
+      say(confirmation);
+    } catch (error) {
+      console.error("Reminder preview failed:", error);
+      const message = error.message || "Could not prepare reminder.";
+      setReminderNotice(message);
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", content: message, error: true },
+      ]);
+      setStatus("Could not prepare reminder");
+      say(message);
+    } finally {
+      setReminderBusy(false);
+    }
+  }
+
+  async function confirmVoiceReminder() {
+    const draft = reminderDraftRef.current;
+    if (!draft || reminderBusy) return;
+
+    setReminderBusy(true);
+    try {
+      const response = await fetch(`${API_BASE}/api/reminders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: draft.title,
+          due_at: draft.due_at,
+          timezone: draft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",
+          token: draft.token,
+          body: draft.body || `Reminder: ${draft.title}`,
+          url: "/",
+        }),
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(formatApiError(data, "Could not schedule reminder."));
+      }
+
+      const message = data.message || `Reminder scheduled: ${draft.title}`;
+      updateReminderDraft(null);
+      setReminderNotice(message);
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", content: message },
+      ]);
+      setStatus("Reminder scheduled");
+      setReminderListVersion((v) => v + 1);
+      say(message);
+    } catch (error) {
+      console.error("Reminder scheduling failed:", error);
+      const message = error.message || "Could not schedule reminder.";
+      setReminderNotice(message);
+      setStatus("Reminder scheduling failed");
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", content: message, error: true },
+      ]);
+      say(message);
+    } finally {
+      setReminderBusy(false);
+    }
+  }
+
+  function cancelVoiceReminder() {
+    updateReminderDraft(null);
+    setReminderNotice("Reminder cancelled.");
+    setStatus("Reminder cancelled");
+  }
+
 async function sendMessage(text = input) {
   const message = text.trim();
 
@@ -297,6 +592,59 @@ async function sendMessage(text = input) {
       emptyMessage: !message,
       busy,
     });
+    return;
+  }
+
+    // Allow voice or text confirmation/cancellation for a pending reminder.
+    // Speech recognition adds punctuation ("Yes."), so strip it before matching.
+    const spoken = message.replace(/[.!?,]+$/g, "").trim();
+
+    if (reminderDraftRef.current && /^(yes|yeah|yep|confirm|confirm reminder|schedule it|yes schedule it)$/i.test(spoken)) {
+      setInput("");
+      setMessages((previous) => [...previous, { role: "user", content: message }]);
+      await confirmVoiceReminder();
+      return;
+    }
+
+    if (reminderDraftRef.current && /^(no|nope|cancel|cancel reminder|don't schedule it|do not schedule it)$/i.test(spoken)) {
+      setInput("");
+      setMessages((previous) => [...previous, { role: "user", content: message }]);
+      cancelVoiceReminder();
+      return;
+    }
+
+    // Route reminder commands to the reminder preview flow.
+    const isReminderCommand =
+      !/^\s*(what|how|why|who|when|where|is|are|does|do)\b/i.test(message) &&
+      /\b(?:remind|reminders?|remainders?|remember\s+me\s+to|timer|alarm)\b/i.test(message);
+
+    console.log("[AURA] Heard:", JSON.stringify(message), "| reminder command:", isReminderCommand);
+
+    if (isReminderCommand) {
+      setInput("");
+      setMessages((previous) => [...previous, { role: "user", content: message }]);
+      await prepareVoiceReminder(message);
+      return;
+    }
+
+  // Handle a test notification command locally, without calling the AI backend.
+  const normalizedMessage = message.toLowerCase();
+  const isTestNotificationCommand =
+    normalizedMessage.includes("test notification") ||
+    normalizedMessage.includes("send me a notification") ||
+    normalizedMessage.includes("send a test notification");
+
+  if (isTestNotificationCommand) {
+    const result = sendTestNotification();
+
+    setInput("");
+    setMessages((previous) => [
+      ...previous,
+      { role: "user", content: message },
+      { role: "assistant", content: result.message },
+    ]);
+    setStatus(result.success ? "Test notification sent" : result.message);
+    say(result.message);
     return;
   }
 
@@ -507,6 +855,8 @@ say(reply);
     }
   }
 
+  const unreadReminders = firedReminders.filter((event) => event.id > seenEventId).length;
+
   const mapUrl =
     location?.latitude != null && location?.longitude != null
       ? `https://www.google.com/maps?q=${location.latitude},${location.longitude}`
@@ -553,6 +903,19 @@ say(reply);
           Approx. IP location
         </button>
 
+        <button
+          className="nav-item"
+          type="button"
+          onClick={() => setShowReminders(true)}
+        >
+          <AlarmClock size={18} />
+          Set reminder
+        </button>
+
+        <div className="notification-sidebar">
+  <NotificationSettings />
+</div>
+
         <div className="sidebar-bottom">
           <div className="secure-card">
             <ShieldCheck size={18} />
@@ -592,6 +955,89 @@ say(reply);
             {apiOnline ? "Backend connected" : "Backend not connected"}
           </div>
 
+          <div style={{ position: "relative" }}>
+            <button
+              className="icon-button"
+              type="button"
+              title="Reminder notifications"
+              aria-label="Reminder notifications"
+              onClick={() => setShowReminderPanel((value) => !value)}
+            >
+              <Bell size={18} />
+              {unreadReminders > 0 && (
+                <span
+                  style={{
+                    position: "absolute",
+                    top: -4,
+                    right: -4,
+                    minWidth: 18,
+                    height: 18,
+                    padding: "0 5px",
+                    borderRadius: 9,
+                    background: "#ef4444",
+                    color: "#fff",
+                    fontSize: 11,
+                    lineHeight: "18px",
+                    textAlign: "center",
+                  }}
+                >
+                  {unreadReminders}
+                </span>
+              )}
+            </button>
+
+            {showReminderPanel && (
+              <div
+                role="dialog"
+                aria-label="Triggered reminders"
+                style={{
+                  position: "absolute",
+                  top: "calc(100% + 8px)",
+                  right: 0,
+                  width: 340,
+                  maxWidth: "90vw",
+                  maxHeight: "70vh",
+                  overflowY: "auto",
+                  zIndex: 50,
+                  padding: 12,
+                  borderRadius: 12,
+                  border: "1px solid #374151",
+                  background: "#1f2937",
+                  color: "#f9fafb",
+                  boxShadow: "0 10px 30px rgba(0,0,0,0.4)",
+                }}
+              >
+                <strong style={{ display: "block", marginBottom: 8 }}>
+                  Triggered reminders
+                </strong>
+                {firedReminders.length === 0 ? (
+                  <p style={{ opacity: 0.7, margin: 0 }}>
+                    No reminders have triggered yet.
+                  </p>
+                ) : (
+                  firedReminders.map((event) => (
+                    <div
+                      key={event.id}
+                      style={{
+                        padding: "8px 0",
+                        borderTop: "1px solid #374151",
+                      }}
+                    >
+                      <div>⏰ {event.title}</div>
+                      <small style={{ opacity: 0.7 }}>
+                        {new Date(event.fired_at).toLocaleString("en-IN", {
+                          dateStyle: "medium",
+                          timeStyle: "short",
+                        })}
+                        {event.status === "push_failed" && " · push failed"}
+                      </small>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+
           <button
             className="icon-button"
             type="button"
@@ -608,6 +1054,38 @@ say(reply);
             {speakReplies ? <Volume2 size={18} /> : <VolumeX size={18} />}
           </button>
         </header>
+
+        {reminderAlert && (
+          <div
+            role="alert"
+            style={{
+              margin: "12px 16px 0",
+              padding: "14px 16px",
+              borderRadius: "12px",
+              border: "1px solid #f59e0b",
+              background: "rgba(245, 158, 11, 0.15)",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+              gap: "12px",
+            }}
+          >
+            <span>
+              <strong>⏰ Reminder:</strong> {reminderAlert.title}
+              {reminderAlert.firedAt && (
+                <small style={{ marginLeft: 8, opacity: 0.7 }}>
+                  {new Date(reminderAlert.firedAt).toLocaleTimeString("en-IN", {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}
+                </small>
+              )}
+            </span>
+            <button type="button" onClick={() => setReminderAlert(null)}>
+              Dismiss
+            </button>
+          </div>
+        )}
 
         <section className="content-area">
           <div className="hero">
@@ -735,6 +1213,44 @@ say(reply);
               <div ref={bottomRef} />
             </div>
 
+            {reminderDraft && (
+              <section
+                className="reminder-confirmation"
+                aria-live="polite"
+                style={{
+                  margin: "12px 16px",
+                  padding: "16px",
+                  border: "1px solid var(--border-color, #d1d5db)",
+                  borderRadius: "12px",
+                }}
+              >
+                <h3 style={{ marginTop: 0 }}>Confirm reminder</h3>
+                <p><strong>Task:</strong> {reminderDraft.title}</p>
+                <p>
+                  <strong>Date and time:</strong>{" "}
+                  {new Date(reminderDraft.due_at).toLocaleString("en-IN", {
+                    timeZone: reminderDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",
+                    dateStyle: "full",
+                    timeStyle: "short",
+                  })}
+                </p>
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                  <button type="button" onClick={confirmVoiceReminder} disabled={reminderBusy}>
+                    {reminderBusy ? "Scheduling…" : "Confirm and schedule"}
+                  </button>
+                  <button type="button" onClick={cancelVoiceReminder} disabled={reminderBusy}>
+                    Cancel
+                  </button>
+                </div>
+              </section>
+            )}
+            {reminderBusy && !reminderDraft && (
+              <p style={{ padding: "0 16px" }} role="status">Preparing reminder…</p>
+            )}
+            {reminderNotice && !reminderDraft && !reminderBusy && (
+              <p style={{ padding: "0 16px" }} role="status">{reminderNotice}</p>
+            )}
+
             <form
               className="composer"
               onSubmit={(event) => {
@@ -840,6 +1356,14 @@ say(reply);
           Location access requires your permission
         </footer>
       </main>
+
+      <RemindersManager
+        open={showReminders}
+        onClose={() => setShowReminders(false)}
+        apiBase={API_BASE}
+        refreshKey={reminderListVersion}
+        onChanged={() => setReminderListVersion((v) => v + 1)}
+      />
     </div>
   );
 }

@@ -1,0 +1,1 @@
+self.FIREBASE_CONFIG = {"apiKey":"AIzaSyDgL_aTTH-j8g58pKgH8xcF3ak_Sldzig8","authDomain":"mypagent-beed5.firebaseapp.com","projectId":"mypagent-beed5","storageBucket":"mypagent-beed5.firebasestorage.app","messagingSenderId":"437889428304","appId":"1:437889428304:web:0fafe049aae6bcfff9da55"};
