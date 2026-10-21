@@ -16,13 +16,19 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
+const vapidKey = import.meta.env.VITE_FIREBASE_VAPID_KEY;
+
 export const app = getApps().length
   ? getApp()
   : initializeApp(firebaseConfig);
 
 async function getMessagingInstance() {
-  if (!(await isSupported())) {
-    throw new Error("Firebase Messaging is not supported in this browser.");
+  const supported = await isSupported();
+
+  if (!supported) {
+    throw new Error(
+      "Firebase Messaging is not supported in this browser."
+    );
   }
 
   return getMessaging(app);
@@ -33,26 +39,79 @@ export async function enableNotifications() {
     throw new Error("Notifications are not supported.");
   }
 
-  const permission = await Notification.requestPermission();
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("Service workers are not supported.");
+  }
+
+  if (!("PushManager" in window)) {
+    throw new Error("Push notifications are not supported.");
+  }
+
+  if (!vapidKey) {
+    throw new Error(
+      "VITE_FIREBASE_VAPID_KEY is missing."
+    );
+  }
+
+  const requiredConfig = [
+    "apiKey",
+    "authDomain",
+    "projectId",
+    "messagingSenderId",
+    "appId",
+  ];
+
+  const missingConfig = requiredConfig.filter(
+    (key) => !firebaseConfig[key]
+  );
+
+  if (missingConfig.length > 0) {
+    throw new Error(
+      `Missing Firebase configuration: ${missingConfig.join(", ")}`
+    );
+  }
+
+  let permission = Notification.permission;
+
+  if (permission === "default") {
+    permission = await Notification.requestPermission();
+  }
 
   if (permission !== "granted") {
-    throw new Error("Notification permission denied.");
+    throw new Error(
+      `Notification permission is ${permission}.`
+    );
+  }
+
+  const registration = await navigator.serviceWorker.register(
+    "/firebase-messaging-sw.js"
+  );
+
+  await navigator.serviceWorker.ready;
+
+  if (!registration.active) {
+    throw new Error(
+      "Firebase messaging service worker is not active."
+    );
   }
 
   const messaging = await getMessagingInstance();
-  const vapidKey = import.meta.env.VITE_FIREBASE_VAPID_KEY;
 
-  if (!vapidKey) {
-    throw new Error("VITE_FIREBASE_VAPID_KEY is missing.");
-  }
+  console.log("Firebase project:", firebaseConfig.projectId);
+  console.log("Service worker:", registration.active.scriptURL);
+  console.log("VAPID key present:", Boolean(vapidKey));
 
-  const token = await getToken(messaging, { vapidKey });
+  const token = await getToken(messaging, {
+    vapidKey,
+    serviceWorkerRegistration: registration,
+  });
 
   if (!token) {
-    throw new Error("Unable to generate FCM token.");
+    throw new Error("Firebase did not return an FCM token.");
   }
 
-  console.log("FCM Token:", token);
+  console.log("FCM token generated successfully.");
+
   return token;
 }
 
@@ -62,6 +121,7 @@ export async function getFcmToken() {
 
 export async function disableNotifications() {
   const messaging = await getMessagingInstance();
-  await deleteToken(messaging);
-  return true;
+  const deleted = await deleteToken(messaging);
+
+  return deleted;
 }
