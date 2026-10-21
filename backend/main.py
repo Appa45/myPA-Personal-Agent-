@@ -557,8 +557,36 @@ def update_reminder(reminder_id: str, payload: ReminderUpdateRequest):
     }
 
 
+
 @app.delete("/api/reminders/{reminder_id}")
 def cancel_reminder(reminder_id: str):
+    try:
+        job = scheduler.get_job(reminder_id)
+
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Reminder not found or already triggered.",
+            )
+
+        scheduler.remove_job(reminder_id)
+
+        return {
+            "success": True,
+            "id": reminder_id,
+            "message": "Reminder cancelled successfully.",
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as exc:
+        logging.exception("Could not cancel reminder %s", reminder_id)
+        raise HTTPException(
+            status_code=500,
+            detail="Could not cancel reminder. Check scheduler configuration.",
+        ) from exc
+
     try:
         scheduler.remove_job(reminder_id)
         return {"success": True, "message": "Reminder cancelled."}
