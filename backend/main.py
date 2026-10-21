@@ -341,8 +341,71 @@ def test_notification(payload: TestNotificationRequest):
 
 # -------------------- Scheduled Reminders --------------------
 
+
 @app.post("/api/reminders")
 def create_reminder(payload: ReminderRequest):
+    """Schedule a one-time reminder."""
+
+    try:
+        due_at = normalize_due_at(payload.due_at)
+
+        if due_at is None:
+            raise ValueError("normalize_due_at returned None")
+
+        if due_at.tzinfo is None or due_at.utcoffset() is None:
+            raise ValueError("Reminder datetime must be timezone-aware")
+
+        logging.info(
+            "Creating reminder: title=%r, due_at=%s, scheduler_running=%s",
+            payload.title,
+            due_at.isoformat(),
+            scheduler.running,
+        )
+
+        reminder_id = f"aura-reminder-{uuid.uuid4().hex}"
+
+        scheduler.add_job(
+            deliver_reminder,
+            trigger=DateTrigger(run_date=due_at),
+            args=[
+                payload.title,
+                payload.body,
+                payload.token,
+                payload.url,
+            ],
+            id=reminder_id,
+            name=payload.title,
+            replace_existing=False,
+            misfire_grace_time=3600,
+        )
+
+        job = scheduler.get_job(reminder_id)
+
+        if job is None:
+            raise RuntimeError(
+                "Scheduler did not return the newly created reminder job"
+            )
+
+        return {
+            "success": True,
+            "id": reminder_id,
+            "title": payload.title,
+            "due_at": job.next_run_time.isoformat(),
+            "timezone": str(LOCAL_TIMEZONE),
+            "message": "Reminder scheduled successfully.",
+        }
+
+    except Exception as exc:
+        logging.exception(
+            "Could not schedule reminder: %s",
+            str(exc),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Could not schedule reminder. Check scheduler configuration.",
+        ) from exc
+
     """
     Schedule a one-time reminder.
     Send due_at as ISO 8601 with timezone, e.g. 2026-10-22T09:00:00+05:30.
