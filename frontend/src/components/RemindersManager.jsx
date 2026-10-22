@@ -103,7 +103,7 @@ const styles = {
   },
 };
 
-export default function RemindersManager({ open, onClose, apiBase, refreshKey = 0, onChanged }) {
+export default function RemindersManager({ open, onClose, apiBase, refreshKey = 0, onChanged, inline = false }) {
   const [reminders, setReminders] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -152,11 +152,11 @@ export default function RemindersManager({ open, onClose, apiBase, refreshKey = 
 
   // Close on Escape.
   useEffect(() => {
-    if (!open) return undefined;
+    if (!open || inline) return undefined;
     const onKey = (event) => event.key === "Escape" && onClose?.();
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
+  }, [open, onClose, inline]);
 
   if (!open) return null;
 
@@ -277,12 +277,22 @@ export default function RemindersManager({ open, onClose, apiBase, refreshKey = 
     }
   }
 
-  return (
-    <div
-      style={styles.backdrop}
-      onClick={(event) => event.target === event.currentTarget && onClose?.()}
-    >
-      <section style={styles.panel} role="dialog" aria-modal="true" aria-label="Manage reminders">
+  const managerPanel = (
+      <section
+        style={inline ? {
+          width: "100%",
+          minWidth: 0,
+          boxSizing: "border-box",
+          background: "#ffffff",
+          color: "#111827",
+          border: "1px solid #e5e7eb",
+          borderRadius: 16,
+          padding: 20,
+          boxShadow: "0 8px 24px rgba(15, 23, 42, 0.10)",
+        } : styles.panel}
+        role="region"
+        aria-label="Manage reminders"
+      >
         <div style={{ ...styles.row, justifyContent: "space-between", marginBottom: 14 }}>
           <h2 style={{ margin: 0, display: "flex", alignItems: "center", gap: 8, fontSize: 20 }}>
             <AlarmClock size={20} /> Reminders
@@ -291,9 +301,11 @@ export default function RemindersManager({ open, onClose, apiBase, refreshKey = 
             <button type="button" style={styles.button} onClick={load} disabled={loading} title="Refresh">
               <RefreshCw size={15} />
             </button>
-            <button type="button" style={styles.button} onClick={onClose} aria-label="Close">
-              <X size={15} />
-            </button>
+            {!inline && (
+              <button type="button" style={styles.button} onClick={onClose} aria-label="Close">
+                <X size={15} />
+              </button>
+            )}
           </div>
         </div>
 
@@ -332,7 +344,7 @@ export default function RemindersManager({ open, onClose, apiBase, refreshKey = 
           </div>
         )}
         {notice && !error && (
-          <div role="status" style={{ margin: "10px 0", color: "#86efac" }}>
+          <div role="status" style={{ margin: "10px 0", color: inline ? "#166534" : "#86efac" }}>
             {notice}
           </div>
         )}
@@ -420,6 +432,16 @@ export default function RemindersManager({ open, onClose, apiBase, refreshKey = 
           );
         })}
       </section>
+  );
+
+  if (inline) return managerPanel;
+
+  return (
+    <div
+      style={styles.backdrop}
+      onClick={(event) => event.target === event.currentTarget && onClose?.()}
+    >
+      {managerPanel}
     </div>
   );
 }

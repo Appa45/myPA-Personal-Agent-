@@ -1,26 +1,24 @@
 import React, { useEffect, useRef, useState } from "react";
+import "./App.css";
 import {
   Activity,
   AlarmClock,
-  AudioLines,
   Bell,
   Bot,
-  Compass,
-  ExternalLink,
-  MapPin,
   Mic,
+  Mail,
+  Inbox,
+  ChevronRight,
   MicOff,
-  Navigation,
   Send,
   ShieldCheck,
   Sparkles,
   Volume2,
-  VolumeX,
 } from "lucide-react";
 
 import NotificationSettings from "./components/NotificationSettings";
 import RemindersManager from "./components/RemindersManager";
-import ChatMessages from "./components/ChatMessages";
+import EmailScheduler from "./EmailScheduler";
 import { enableNotifications } from "./firebase";
 // import Testtoken from "./TokenTest"
 
@@ -32,7 +30,7 @@ const initialMessages = [
   {
     role: "assistant",
     content:
-      "Hello! I’m AURA. Ask me a question, check your approximate location, read your latest Gmail messages, or get current news.",
+      "Hello! I’m AURA. I can set reminders, draft and schedule emails, read your latest emails, summarize messages, and help with everyday tasks. Try one of the prompts below or speak naturally.",
   },
 ];
 
@@ -55,15 +53,53 @@ function formatApiError(data, fallback) {
   return fallback;
 }
 
+function isNaturalLanguageReminder(message) {
+  const text = message.toLowerCase().trim();
+
+  // Existing explicit reminder commands always qualify.
+  const explicitReminder =
+    /\b(?:remind(?:er|ers)?|remainders?|remember me to|set an alarm|set a timer|wake me)\b/i.test(
+      text
+    );
+
+  if (explicitReminder) return true;
+
+  // Detect future dates and times.
+  const futureTime =
+    /\b(?:today|tonight|tomorrow|day after tomorrow|next week|this evening|this afternoon|this morning)\b/i.test(
+      text
+    ) ||
+    /\b(?:in\s+\d+\s+(?:seconds?|minutes?|hours?|days?|weeks?))\b/i.test(
+      text
+    ) ||
+    /\b(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)\b/i.test(
+      text
+    ) ||
+    /\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i.test(
+      text
+    ) ||
+    /\b(?:at|by|before|after)\s+\d{1,2}(?::\d{2})?\b/i.test(text);
+
+  // Detect an action or event to remember.
+  const taskIntent =
+    /\b(?:call|meet|attend|pay|submit|send|take|drink|buy|pick up|visit|finish|start|go|check|prepare|study|exercise|book|collect|complete|renew|review|join|discuss|appointment|meeting|interview|deadline|birthday|bill|medicine|medication|don't forget|do not forget|need to|make sure)\b/i.test(
+      text
+    );
+
+  return futureTime && taskIntent;
+}
+
 export default function App() {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
+  const [activeSidePanel, setActiveSidePanel] = useState("actions");
+  const [reminderItems, setReminderItems] = useState([]);
+  const [remindersLoading, setRemindersLoading] = useState(false);
+  const [remindersError, setRemindersError] = useState("");
   const [busy, setBusy] = useState(false);
   const [listening, setListening] = useState(false);
   const [speakReplies, setSpeakReplies] = useState(true);
   const [apiOnline, setApiOnline] = useState(false);
-  const [location, setLocation] = useState(null);
-  const [locationLoading, setLocationLoading] = useState(false);
   const [status, setStatus] = useState("Ready when you are");
   const [voiceMode, setVoiceMode] = useState(false);
   const [reminderDraft, setReminderDraft] = useState(null);
@@ -86,6 +122,8 @@ export default function App() {
   const bottomRef = useRef(null);
   const recognitionRef = useRef(null);
   const restartTimerRef = useRef(null);
+
+  const toggleMicRef = useRef(null);
 
   // Check the Python backend without returning a Promise from useEffect.
   useEffect(() => {
@@ -393,26 +431,37 @@ function startListening() {
     if (transcript) setInput(transcript);
   };
 
-  recognition.onerror = (event) => {
-    hadRecognitionError = true;
-    setListening(false);
+recognition.onerror = (event) => {
+  hadRecognitionError = true;
 
-    const messages = {
-      "not-allowed": "Microphone permission denied. Allow microphone access in browser settings.",
-      "no-speech": "I couldn't hear anything. Please try speaking again.",
-      "audio-capture": "No microphone detected. Check your microphone connection.",
-      network: "Voice recognition network error. Try Chrome/Edge again or use text input.",
-    };
+  console.error("[AURA] Recognition error:", event.error);
+  console.log("[AURA] Voice mode before error:", voiceModeRef.current);
 
-    setStatus(messages[event.error] || `Microphone error: ${event.error}`);
-    console.error("[AURA] Speech recognition error:", event.error);
+  setListening(false);
 
-    // Stop automatic retries on errors, especially network errors, to avoid a retry loop.
-    voiceModeRef.current = false;
-    setVoiceMode(false);
+  const messages = {
+    "not-allowed": "Microphone permission denied. Allow microphone access.",
+    "no-speech": "No speech detected. Please try again.",
+    "audio-capture": "No microphone detected. Check your microphone.",
+    network: "Speech recognition network error.",
+    aborted: "Speech recognition was interrupted.",
+    "service-not-allowed": "Speech recognition service is not allowed.",
   };
 
+  setStatus(messages[event.error] || `Microphone error: ${event.error}`);
+
+  // Stop retrying after a real recognition error.
+  voiceModeRef.current = false;
+  setVoiceMode(false);
+};
+
   recognition.onend = () => {
+     console.log("[AURA] Recognition ended", {
+    voiceMode: voiceModeRef.current,
+    transcript: finalTranscript,
+    hadRecognitionError,
+  });
+  
     setListening(false);
     if (recognitionRef.current === recognition) recognitionRef.current = null;
 
@@ -473,6 +522,31 @@ function toggleMic() {
   setStatus("Starting voice mode…");
   startListening();
 }
+
+// Keep the latest toggleMic function in the ref.
+toggleMicRef.current = toggleMic;
+
+// Listen for clicks from the floating Electron emoji.
+useEffect(() => {
+  if (!window.auraDesktop?.onToggleListening) {
+    console.log("[AURA] Running without the Electron floating assistant");
+    return;
+  }
+
+  const unsubscribe = window.auraDesktop.onToggleListening(() => {
+    console.log("[AURA] Floating emoji clicked");
+
+    toggleMicRef.current?.();
+  });
+
+  console.log("[AURA] Electron bridge connected");
+
+  return () => {
+    if (typeof unsubscribe === "function") {
+      unsubscribe();
+    }
+  };
+}, []);
 
 
 function sendTestNotification() {
@@ -662,18 +736,41 @@ async function sendMessage(text = input) {
     }
 
     // Route reminder commands to the reminder preview flow.
-    const isReminderCommand =
-      !/^\s*(what|how|why|who|when|where|is|are|does|do)\b/i.test(message) &&
-      /\b(?:remind|reminders?|remainders?|remember\s+me\s+to|timer|alarm)\b/i.test(message);
+    // const isReminderCommand =
+    //   !/^\s*(what|how|why|who|when|where|is|are|does|do)\b/i.test(message) &&
+    //   /\b(?:remind|reminders?|remainders?|remember\s+me\s+to|timer|alarm)\b/i.test(message);
 
-    console.log("[AURA] Heard:", JSON.stringify(message), "| reminder command:", isReminderCommand);
+    // console.log("[AURA] Heard:", JSON.stringify(message), "| reminder command:", isReminderCommand);
 
-    if (isReminderCommand) {
-      setInput("");
-      setMessages((previous) => [...previous, { role: "user", content: message }]);
-      await prepareVoiceReminder(message);
-      return;
-    }
+    // if (isReminderCommand) {
+    //   setInput("");
+    //   setMessages((previous) => [...previous, { role: "user", content: message }]);
+    //   await prepareVoiceReminder(message);
+    //   return;
+    // }
+
+    // Detect reminders expressed in natural language,
+// even when the user doesn't say "reminder".
+const isReminderCommand = isNaturalLanguageReminder(message);
+
+console.log(
+  "[AURA] Heard:",
+  JSON.stringify(message),
+  "| reminder command:",
+  isReminderCommand
+);
+
+if (isReminderCommand) {
+  setInput("");
+
+  setMessages((previous) => [
+    ...previous,
+    { role: "user", content: message },
+  ]);
+
+  await prepareVoiceReminder(message);
+  return;
+}
 
   // Handle a test notification command locally, without calling the AI backend.
   const normalizedMessage = message.toLowerCase();
@@ -794,578 +891,157 @@ say(reply);
     logTime("Chat request finished");
   }
 }
-
-
-
-  function getDeviceLocation() {
-    if (!navigator.geolocation) {
-      setStatus("Device geolocation is not supported");
-      return;
-    }
-
-    setLocationLoading(true);
-    setStatus("Waiting for location permission…");
-
-    navigator.geolocation.getCurrentPosition(
-      (position) => {
-        const loc = {
-          latitude: position.coords.latitude,
-          longitude: position.coords.longitude,
-          accuracy: Math.round(position.coords.accuracy),
-        };
-
-        setLocation(loc);
-        setLocationLoading(false);
-        setStatus("Device location retrieved");
-
-        setMessages((previous) => [
-          ...previous,
-          {
-            role: "assistant",
-            content:
-              `Your browser provided device coordinates: ` +
-              `latitude ${loc.latitude.toFixed(6)}, ` +
-              `longitude ${loc.longitude.toFixed(6)}. ` +
-              `Reported accuracy: about ${loc.accuracy} metres. ` +
-              "Accuracy depends on your device and available location signals.",
-          },
-        ]);
-      },
-      (error) => {
-        setLocationLoading(false);
-
-        setStatus(
-          error.code === 1
-            ? "Location permission denied"
-            : "Could not retrieve device location"
-        );
-
-        setMessages((previous) => [
-          ...previous,
-          {
-            role: "assistant",
-            content:
-              `I couldn't access device location: ${error.message}. ` +
-              "Allow location access in your browser and try again.",
-          },
-        ]);
-      },
-      {
-        enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 30000,
-      }
-    );
-  }
-
-  async function getApproxLocation() {
-    setLocationLoading(true);
-    setStatus("Finding approximate location…");
-
+  async function loadReminderList() {
+    setRemindersLoading(true);
+    setRemindersError("");
     try {
-      const response = await fetch(`${API_BASE}/api/location`);
+      const response = await fetch(`${API_BASE}/api/reminders`);
       const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail || "Location lookup failed");
-      }
-
-      setLocation(data);
-
-      const place = [data.city, data.region, data.country]
-        .filter(Boolean)
-        .join(", ");
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          content:
-            `Your approximate IP location is ${place || "not available"}. ` +
-            "This is network-based and may not match your exact device location.",
-        },
-      ]);
-
-      setStatus("Approximate location retrieved");
+      if (!response.ok) throw new Error(formatApiError(data, "Could not load reminders."));
+      const rows = Array.isArray(data) ? data : (data.reminders || data.items || data.results || []);
+      setReminderItems(rows);
     } catch (error) {
-      setStatus(error.message);
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: "assistant",
-          content: `Could not retrieve approximate location: ${error.message}`,
-          error: true,
-        },
-      ]);
+      console.error("Reminder list load failed:", error);
+      setRemindersError(error.message || "Could not load reminders.");
+      setReminderItems([]);
     } finally {
-      setLocationLoading(false);
+      setRemindersLoading(false);
     }
   }
 
+  useEffect(() => {
+    if (activeSidePanel === "reminders") void loadReminderList();
+  }, [activeSidePanel, reminderListVersion]);
   const unreadReminders = firedReminders.filter((event) => event.id > seenEventId).length;
 
-  const mapUrl =
-    location?.latitude != null && location?.longitude != null
-      ? `https://www.google.com/maps?q=${location.latitude},${location.longitude}`
-      : null;
-
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark">
-            <AudioLines size={24} />
-          </div>
-          <div>
-            <strong>AURA</strong>
-            <span>PERSONAL AI</span>
-          </div>
+    <div className="aura-dashboard">
+
+
+      <div className="aura-sunset" aria-hidden="true" />
+      <div className="aura-skyline" aria-hidden="true" />
+
+      <aside className="aura-sidebar">
+        <div className="aura-brand">
+          <div className="aura-brand-mark"><Bot size={25} /></div>
+          <div className="aura-brand-copy">AURA Voice<br />Assistant</div>
         </div>
-
-        <div className="side-label">WORKSPACE</div>
-
-        <button className="nav-item active" type="button">
-          <Sparkles size={18} />
-          Assistant
-          <span className="nav-dot" />
-        </button>
-
-        <button
-          className="nav-item"
-          type="button"
-          onClick={getDeviceLocation}
-          disabled={locationLoading}
-        >
-          <MapPin size={18} />
-          Device location
-        </button>
-
-        <button
-          className="nav-item"
-          type="button"
-          onClick={getApproxLocation}
-          disabled={locationLoading}
-        >
-          <Compass size={18} />
-          Approx. IP location
-        </button>
-
-        <button
-          className="nav-item"
-          type="button"
-          onClick={() => setShowReminders(true)}
-        >
-          <AlarmClock size={18} />
-          Set reminder
-        </button>
-
-        <div className="notification-sidebar">
-  <NotificationSettings />
-</div>
-
-        <div className="sidebar-bottom">
-          <div className="secure-card">
-            <ShieldCheck size={18} />
-            <div>
-              <strong>Privacy first</strong>
-              <p>
-                Location is requested only when you ask. Email access is
-                read-only.
-              </p>
-            </div>
-          </div>
-
-          <div className="profile">
-            <div className="avatar">A</div>
-            <div>
-              <strong>AURA Assistant</strong>
-              <span>Local web interface</span>
-            </div>
-            <Activity size={17} className="profile-activity" />
-          </div>
-        </div>
+        <div className="aura-nav-label">WORKSPACE</div>
+        <nav className="aura-nav" aria-label="Main navigation">
+          <button className={activeSidePanel === "actions" ? "active" : ""} type="button" onClick={() => setActiveSidePanel("actions")}><Sparkles size={19} /><span>AURA Actions</span></button>
+          <button className={activeSidePanel === "reminders" ? "active" : ""} type="button" onClick={() => { setActiveSidePanel("reminders"); setShowReminders(false); loadReminderList(); }}><AlarmClock size={19} /><span>Reminders</span></button>
+          <button className={activeSidePanel === "emails" ? "active" : ""} type="button" onClick={() => setActiveSidePanel("emails")}><Mail size={19} /><span>Scheduled Emails</span></button>
+        </nav>
+        <div className="aura-notification-settings"><NotificationSettings /></div>
+        <div className="aura-sidebar-spacer" />
+        <div className="aura-privacy"><ShieldCheck size={17} /><span><strong>Privacy first</strong><br />Email access is read-only unless you approve a scheduled email.</span></div>
+        <div className="aura-profile"><div className="aura-avatar">A</div><div className="aura-profile-copy"><strong>AURA Assistant</strong><br /><span style={{color:"#a9c7f3",fontSize:10}}>Personal AI companion</span></div><ChevronRight size={16} className="aura-profile-chevron" /></div>
       </aside>
 
-      <main className="main-panel">
-        <header className="topbar">
-          <div className="mobile-brand">
-            <div className="brand-mark">
-              <AudioLines size={19} />
-            </div>
-            <strong>AURA</strong>
+      <main className="aura-center">
+        <header className="aura-topline">
+          <div className="aura-online"><span className="aura-dot" />{apiOnline ? "Backend connected" : "AURA assistant"}</div>
+          <button className="aura-top-icon" type="button" title={speakReplies ? "Mute spoken replies" : "Enable spoken replies"} onClick={() => { setSpeakReplies((value) => !value); if (speakReplies && "speechSynthesis" in window) window.speechSynthesis.cancel(); }}><Volume2 size={17} /></button>
+          <div style={{position:"relative"}}>
+            <button className="aura-top-icon" type="button" aria-label="Reminder notifications" onClick={() => setShowReminderPanel((value) => !value)}><Bell size={17} />{unreadReminders > 0 && <span style={{position:"absolute",top:-3,right:-3,minWidth:16,height:16,borderRadius:9,background:"#f05267",color:"white",fontSize:9,lineHeight:"16px"}}>{unreadReminders}</span>}</button>
+            {showReminderPanel && <div className="aura-reminder-pop" role="dialog" aria-label="Triggered reminders"><strong>Triggered reminders</strong>{firedReminders.length === 0 ? <p>No reminders have triggered yet.</p> : firedReminders.map((event) => <div className="aura-reminder-pop-item" key={event.id}>⏰ {event.title}<div style={{color:"#71809c",fontSize:10,marginTop:4}}>{new Date(event.fired_at).toLocaleString("en-IN",{dateStyle:"medium",timeStyle:"short"})}</div></div>)}</div>}
           </div>
-
-          <div className="connection">
-            <span
-              className={`connection-dot ${apiOnline ? "online" : ""}`}
-            />
-            {apiOnline ? "Backend connected" : "Backend not connected"}
-          </div>
-
-          <div style={{ position: "relative" }}>
-            <button
-              className="icon-button"
-              type="button"
-              title="Reminder notifications"
-              aria-label="Reminder notifications"
-              onClick={() => setShowReminderPanel((value) => !value)}
-            >
-              <Bell size={18} />
-              {unreadReminders > 0 && (
-                <span
-                  style={{
-                    position: "absolute",
-                    top: -4,
-                    right: -4,
-                    minWidth: 18,
-                    height: 18,
-                    padding: "0 5px",
-                    borderRadius: 9,
-                    background: "#ef4444",
-                    color: "#fff",
-                    fontSize: 11,
-                    lineHeight: "18px",
-                    textAlign: "center",
-                  }}
-                >
-                  {unreadReminders}
-                </span>
-              )}
-            </button>
-
-            {showReminderPanel && (
-              <div
-                role="dialog"
-                aria-label="Triggered reminders"
-                style={{
-                  position: "absolute",
-                  top: "calc(100% + 8px)",
-                  right: 0,
-                  width: 340,
-                  maxWidth: "90vw",
-                  maxHeight: "70vh",
-                  overflowY: "auto",
-                  zIndex: 50,
-                  padding: 12,
-                  borderRadius: 12,
-                  border: "1px solid #374151",
-                  background: "#1f2937",
-                  color: "#f9fafb",
-                  boxShadow: "0 10px 30px rgba(0,0,0,0.4)",
-                }}
-              >
-                <strong style={{ display: "block", marginBottom: 8 }}>
-                  Triggered reminders
-                </strong>
-                {firedReminders.length === 0 ? (
-                  <p style={{ opacity: 0.7, margin: 0 }}>
-                    No reminders have triggered yet.
-                  </p>
-                ) : (
-                  firedReminders.map((event) => (
-                    <div
-                      key={event.id}
-                      style={{
-                        padding: "8px 0",
-                        borderTop: "1px solid #374151",
-                      }}
-                    >
-                      <div>⏰ {event.title}</div>
-                      <small style={{ opacity: 0.7 }}>
-                        {new Date(event.fired_at).toLocaleString("en-IN", {
-                          dateStyle: "medium",
-                          timeStyle: "short",
-                        })}
-                        {event.status === "push_failed" && " · push failed"}
-                      </small>
-                    </div>
-                  ))
-                )}
-              </div>
-            )}
-          </div>
-
-          <button
-            className="icon-button"
-            type="button"
-            title={speakReplies ? "Mute replies" : "Enable spoken replies"}
-            onClick={() => {
-              setSpeakReplies((value) => !value);
-
-              if (speakReplies && "speechSynthesis" in window) {
-                window.speechSynthesis.cancel();
-              }
-            }}
-            aria-label="Toggle spoken replies"
-          >
-            {speakReplies ? <Volume2 size={18} /> : <VolumeX size={18} />}
-          </button>
         </header>
 
-        {reminderAlert && (
-          <div
-            role="alert"
-            style={{
-              margin: "12px 16px 0",
-              padding: "14px 16px",
-              borderRadius: "12px",
-              border: "1px solid #f59e0b",
-              background: "rgba(245, 158, 11, 0.15)",
-              display: "flex",
-              justifyContent: "space-between",
-              alignItems: "center",
-              gap: "12px",
-            }}
-          >
-            <span>
-              <strong>⏰ Reminder:</strong> {reminderAlert.title}
-              {reminderAlert.firedAt && (
-                <small style={{ marginLeft: 8, opacity: 0.7 }}>
-                  {new Date(reminderAlert.firedAt).toLocaleTimeString("en-IN", {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
-                </small>
-              )}
-            </span>
-            <button type="button" onClick={() => setReminderAlert(null)}>
-              Dismiss
-            </button>
+        {reminderAlert && <div className="aura-reminder-alert" role="alert"><AlarmClock size={16} /><span><strong>Reminder:</strong> {reminderAlert.title}</span><button type="button" onClick={() => setReminderAlert(null)} aria-label="Dismiss reminder">×</button></div>}
+        {status && status !== "Ready when you are" && <div className="aura-status-alert" role="status">{status}</div>}
+
+        <section className="aura-hero">
+          <div className="aura-pill"><Sparkles size={15} /> AURA VOICE ASSISTANT</div>
+          <h1>{listening ? "I'm listening 🎙️" : "Hello! 👋"}<span>{listening ? "Speak naturally, I'm here to help" : "How can I help you today?"}</span></h1>
+          <div className="aura-orb-zone">
+            <div className="aura-orb-halo" />
+            <div className="aura-wave" aria-hidden="true" />
+            <button className={`aura-orb-button ${listening ? "listening" : ""}`} type="button" onClick={toggleMic} aria-label={voiceMode ? "Stop voice assistant" : "Start voice assistant"} aria-pressed={voiceMode}><Mic size={48} strokeWidth={1.8} /></button>
+            <div className="aura-wave right" aria-hidden="true" />
           </div>
-        )}
+          <div className="aura-tap">{listening ? "Listening… speak now" : voiceMode ? "Voice mode active · tap to stop" : "Tap to speak"}</div>
 
-        <section className="content-area">
-          <div className="hero">
-            <div className="eyebrow">
-              <span className="pulse" />
-              YOUR AI COMPANION
-            </div>
-
-            <div className="orb-wrap">
-              <div className="orb-halo" />
-              <div className="orb">
-                <div className="orb-core" />
-                <div className="orb-shine" />
-              </div>
-              <div className="orbit orbit-one" />
-              <div className="orbit orbit-two" />
-            </div>
-
-            <h1>
-              How can I help <span>you today?</span>
-            </h1>
-
-            <p className="hero-sub">
-              Your voice, your assistant. Ask naturally and let’s get things
-              done.
-            </p>
-
-            <div className="quick-actions">
-              <button
-                type="button"
-                onClick={() =>
-                  sendMessage("Read my latest 3 unread emails and summarize them.")
-                }
-              >
-                <span className="quick-icon mail-icon">✉</span>
-                <span>
-                  <strong>Read my emails</strong>
-                  <small>Summarize unread Gmail</small>
-                </span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => sendMessage("Give me the latest technology news.")}
-              >
-                <span className="quick-icon news-icon">↗</span>
-                <span>
-                  <strong>Latest news</strong>
-                  <small>Headlines that matter</small>
-                </span>
-              </button>
-
-              <button type="button" onClick={getDeviceLocation}>
-                <span className="quick-icon location-icon">
-                  <Navigation size={17} />
-                </span>
-                <span>
-                  <strong>My location</strong>
-                  <small>Use device permission</small>
-                </span>
-              </button>
-            </div>
+          <div className="aura-quick-grid aura-action-prompts">
+            <button className="aura-quick" type="button" onClick={() => sendMessage("Remind me to call [person] at 5 PM today")}><AlarmClock color="#ffb84e" /><strong>Set a reminder</strong><span>Choose a task and time</span></button>
+            <button className="aura-quick" type="button" onClick={() => sendMessage("Draft an email to my saved recipient asking to reschedule a meeting")}><Mail color="#54c8ff" /><strong>Draft an email</strong><span>Review before scheduling</span></button>
+            <button className="aura-quick" type="button" onClick={() => sendMessage("Read my latest emails and summarize the important ones")}><Inbox color="#a99bff" /><strong>Read my emails</strong><span>Summarize recent messages</span></button>
+            <button className="aura-quick" type="button" onClick={() => sendMessage("Show my upcoming reminders")}><Bell color="#ff6677" /><strong>Upcoming reminders</strong><span>Check what is next</span></button>
           </div>
 
-          <section className="chat-panel">
-            <div className="chat-heading">
-              <div>
-                <span className="chat-heading-icon">
-                  <Bot size={17} />
-                </span>
-                <strong>Conversation</strong>
-              </div>
-
-              <span className="live-status">
-                <span className="tiny-green" />
-                {status}
-              </span>
-            </div>
-
-            <ChatMessages messages={messages} busy={busy} bottomRef={bottomRef} />
-
-            {reminderDraft && (
-              <section
-                className="reminder-confirmation"
-                aria-live="polite"
-                style={{
-                  margin: "12px 16px",
-                  padding: "16px",
-                  border: "1px solid var(--border-color, #d1d5db)",
-                  borderRadius: "12px",
-                }}
-              >
-                <h3 style={{ marginTop: 0 }}>Confirm reminder</h3>
-                <p><strong>Task:</strong> {reminderDraft.title}</p>
-                <p>
-                  <strong>Date and time:</strong>{" "}
-                  {new Date(reminderDraft.due_at).toLocaleString("en-IN", {
-                    timeZone: reminderDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",
-                    dateStyle: "full",
-                    timeStyle: "short",
-                  })}
-                </p>
-                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                  <button type="button" onClick={confirmVoiceReminder} disabled={reminderBusy}>
-                    {reminderBusy ? "Scheduling…" : "Confirm and schedule"}
-                  </button>
-                  <button type="button" onClick={cancelVoiceReminder} disabled={reminderBusy}>
-                    Cancel
-                  </button>
-                </div>
-              </section>
-            )}
-            {reminderBusy && !reminderDraft && (
-              <p style={{ padding: "0 16px" }} role="status">Preparing reminder…</p>
-            )}
-            {reminderNotice && !reminderDraft && !reminderBusy && (
-              <p style={{ padding: "0 16px" }} role="status">{reminderNotice}</p>
-            )}
-
-            <form
-              className="composer"
-              onSubmit={(event) => {
-                event.preventDefault();
-                sendMessage();
-              }}
-            >
-              <button
-                type="button"
-                className={`mic-button ${voiceMode ? "is-listening" : ""}`}
-                onClick={toggleMic}
-                title={voiceMode ? "Stop voice mode" : "Start voice mode"}
-                aria-label={voiceMode ? "Stop voice mode" : "Start voice mode"}
-              >
-                {voiceMode ? <MicOff size={19} /> : <Mic size={19} />}
-              </button>
-
-              <input
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                placeholder="Message AURA…"
-                aria-label="Message AURA"
-                disabled={busy}
-              />
-
-              <button
-                className="send-button"
-                type="submit"
-                disabled={busy || !input.trim()}
-                aria-label="Send message"
-              >
-                <Send size={17} />
-              </button>
-            </form>
-
-            <div className="composer-foot">
-              <span>
-                <ShieldCheck size={12} />
-                Your API key stays on the backend
-              </span>
-              <span>{voiceMode ? "VOICE MODE ON · CLICK MIC TO STOP" : "ENTER TO SEND · CLICK MIC FOR VOICE MODE"}</span>
-            </div>
-          </section>
-
-          {location && (
-            <div className="location-card">
-              <div className="location-symbol">
-                <MapPin size={20} />
-              </div>
-
-              <div className="location-info">
-                <strong>Location details</strong>
-                <span>
-                  {location.city
-                    ? [location.city, location.region, location.country]
-                        .filter(Boolean)
-                        .join(", ")
-                    : `${location.latitude}, ${location.longitude}`}
-                </span>
-                <small>
-                  {typeof location.accuracy === "number"
-                    ? `Reported accuracy: about ${location.accuracy} m`
-                    : location.accuracy || "Location data"}
-                </small>
-              </div>
-
-              {mapUrl && (
-                <a
-                  href={mapUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="map-link"
-                >
-                  Open map <ExternalLink size={14} />
-                </a>
-              )}
-            </div>
-          )}
-
-          <div className="location-actions">
-            <button
-              type="button"
-              onClick={getDeviceLocation}
-              disabled={locationLoading}
-            >
-              <Navigation size={15} />
-              {locationLoading ? "Getting location…" : "Get device location"}
-            </button>
-
-            <button
-              type="button"
-              onClick={getApproxLocation}
-              disabled={locationLoading}
-            >
-              <Compass size={15} />
-              Approximate IP location
-            </button>
+          <div className="aura-chat-peek" aria-live="polite">
+            {busy ? <span><strong>AURA:</strong> Thinking…</span> : messages.length > 1 ? <><strong>{messages[messages.length - 1]?.role === "user" ? "You" : "AURA"}:</strong> {messages[messages.length - 1]?.content}</> : <span><strong>AURA:</strong> Try: set a reminder, draft an email, read my emails, or summarize an inbox.</span>}
           </div>
+
+          <form className="aura-composer" onSubmit={(event) => { event.preventDefault(); sendMessage(); }}>
+            <Sparkles size={18} color="#c3d5ff" />
+            <input id="aura-message-input" value={input} onChange={(event) => setInput(event.target.value)} placeholder="Ask anything…" aria-label="Message AURA" disabled={busy} />
+            <button type="submit" className="send" aria-label="Send message" disabled={busy || !input.trim()}><Send size={17} /></button>
+            <button type="button" onClick={toggleMic} aria-label={voiceMode ? "Stop voice mode" : "Start voice mode"} title={voiceMode ? "Stop voice mode" : "Start voice mode"}>{voiceMode ? <MicOff size={18} /> : <Mic size={18} />}</button>
+          </form>
         </section>
 
-        <footer className="footer">
-          AURA <span>•</span> Built for helpful conversations <span>•</span>
-          Location access requires your permission
-        </footer>
+        {reminderDraft && <section className="aura-confirm" aria-live="polite"><h3>Confirm reminder</h3><p><strong>Task:</strong> {reminderDraft.title}</p><p><strong>Date and time:</strong> {new Date(reminderDraft.due_at).toLocaleString("en-IN",{timeZone:reminderDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",dateStyle:"medium",timeStyle:"short"})}</p><div className="aura-confirm-actions"><button type="button" onClick={confirmVoiceReminder} disabled={reminderBusy}>{reminderBusy ? "Scheduling…" : "Confirm and schedule"}</button><button type="button" onClick={cancelVoiceReminder} disabled={reminderBusy}>Cancel</button></div></section>}
+        {reminderNotice && !reminderDraft && !reminderBusy && <div className="aura-status-alert" role="status" style={{top:"auto",bottom:70}}>{reminderNotice}</div>}
       </main>
 
-      <RemindersManager
-        open={showReminders}
-        onClose={() => setShowReminders(false)}
-        apiBase={API_BASE}
-        refreshKey={reminderListVersion}
-        onChanged={() => setReminderListVersion((v) => v + 1)}
-      />
+      <aside className="aura-right aura-explore-panel" aria-label={activeSidePanel === "emails" ? "Scheduled emails" : activeSidePanel === "reminders" ? "Reminder list" : "AURA actions"}>
+        {activeSidePanel === "emails" ? (
+          <EmailScheduler apiBase={API_BASE} />
+        ) : activeSidePanel === "reminders" ? (
+          <>
+            <div className="aura-explore-title">
+              <div className="aura-explore-icon"><AlarmClock size={19} /></div>
+              <div><strong>Your reminders</strong><span>Scheduled reminders and their times</span></div>
+              <button className="aura-panel-refresh" type="button" onClick={loadReminderList} aria-label="Refresh reminders">↻</button>
+            </div>
+            {remindersLoading ? <div className="aura-panel-message">Loading your reminders…</div> : remindersError ? <div className="aura-panel-error">{remindersError}<button type="button" onClick={loadReminderList}>Try again</button></div> : reminderItems.length === 0 ? <div className="aura-panel-empty"><AlarmClock size={28} /><strong>No reminders found</strong><span>Ask AURA to remind you of something, and it will appear here.</span></div> : (
+              <div className="aura-side-list">
+                {reminderItems.map((item, index) => {
+                  const due = item.due_at || item.scheduled_at || item.remind_at || item.datetime;
+                  return <article className="aura-side-reminder" key={item.id ?? item._id ?? `${item.title}-${index}`}>
+                    <div className="aura-side-reminder-icon"><AlarmClock size={16} /></div>
+                    <div className="aura-side-reminder-copy"><strong>{item.title || item.name || item.body || "Reminder"}</strong><span>{due ? new Date(due).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" }) : item.status || "Scheduled reminder"}</span>{item.status && <small>{item.status}</small>}</div>
+                  </article>;
+                })}
+              </div>
+            )}
+            <div className="aura-reminders-manage-inline">
+              <div className="aura-reminders-manage-heading">
+                <strong>Manage reminders</strong>
+                <span>Create, edit, or remove your scheduled reminders.</span>
+              </div>
+              <RemindersManager
+                open={true}
+                inline
+                onClose={() => setActiveSidePanel("actions")}
+                apiBase={API_BASE}
+                refreshKey={reminderListVersion}
+                onChanged={() => {
+                  setReminderListVersion((v) => v + 1);
+                  loadReminderList();
+                }}
+              />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="aura-explore-title">
+              <div className="aura-explore-icon"><Sparkles size={19} /></div>
+              <div><strong>Try an AURA action</strong><span>Tap a prompt to start</span></div>
+            </div>
+            <div className="aura-action-list">
+              <button type="button" onClick={() => sendMessage("Remind me to take a break in 30 minutes")}><AlarmClock size={17} /><span><strong>Set a reminder</strong><small>“Remind me to take a break in 30 minutes”</small></span></button>
+              <button type="button" onClick={() => sendMessage("Draft an email to my saved recipient about rescheduling a meeting")}><Mail size={17} /><span><strong>Draft an email</strong><small>“Draft an email about rescheduling a meeting”</small></span></button>
+              <button type="button" onClick={() => sendMessage("Read my latest emails and summarize them")}><Inbox size={17} /><span><strong>Read my emails</strong><small>“Read my latest emails and summarize them”</small></span></button>
+              <button type="button" onClick={() => sendMessage("Show my upcoming reminders")}><Bell size={17} /><span><strong>Upcoming reminders</strong><small>“What reminders do I have?”</small></span></button>
+              <button type="button" onClick={() => sendMessage("Help me plan my day based on my upcoming reminders")}><Activity size={17} /><span><strong>Plan my day</strong><small>“Help me plan my day”</small></span></button>
+            </div>
+            <div className="aura-panel-empty"><Bot size={26} /><strong>Speak or type naturally</strong><span>AURA will respond in chat. For actions such as scheduling a reminder or email, review and confirm before it is saved or sent.</span></div>
+          </>
+        )}
+      </aside>
+
     </div>
   );
 }

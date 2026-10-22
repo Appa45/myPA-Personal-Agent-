@@ -1,0 +1,72 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AURA Mini</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: transparent;
+      font-family: "Segoe UI", sans-serif;
+    }
+
+    .orb {
+      width: 84px;
+      height: 84px;
+      margin: 8px;
+      border: 1px solid rgba(255,255,255,.5);
+      border-radius: 50%;
+      background: linear-gradient(135deg, #38bdf8, #7c3aed);
+      box-shadow: 0 6px 24px rgba(59,130,246,.4);
+      color: white;
+      font-size: 38px;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+      user-select: none;
+      -webkit-app-region: no-drag;
+      transition: transform .2s, box-shadow .2s;
+    }
+
+    .orb:hover { transform: scale(1.06); }
+
+    .orb.listening {
+      box-shadow: 0 0 0 7px rgba(56,189,248,.2),
+                  0 0 30px rgba(56,189,248,.9);
+      animation: pulse 1.2s infinite alternate;
+    }
+
+    @keyframes pulse {
+      from { transform: scale(1); }
+      to { transform: scale(1.07); }
+    }
+
+    .drag-area {
+      -webkit-app-region: drag;
+    }
+  </style>
+</head>
+<body>
+  <button class="orb" id="auraOrb" title="Click to talk to AURA">
+    🤖
+  </button>
+
+  <script>
+    const orb = document.getElementById("auraOrb");
+    let listening = false;
+
+    orb.addEventListener("click", () => {
+      listening = !listening;
+      orb.classList.toggle("listening", listening);
+      orb.textContent = listening ? "🎙️" : "🤖";
+      orb.title = listening ? "Click to stop" : "Click to talk to AURA";
+
+      window.auraDesktop.toggleListening();
+    });
+  </script>
+</body>
+</html>
