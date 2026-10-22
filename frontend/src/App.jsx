@@ -20,6 +20,7 @@ import {
 
 import NotificationSettings from "./components/NotificationSettings";
 import RemindersManager from "./components/RemindersManager";
+import ChatMessages from "./components/ChatMessages";
 import { enableNotifications } from "./firebase";
 // import Testtoken from "./TokenTest"
 
@@ -76,6 +77,8 @@ export default function App() {
   const [seenEventId, setSeenEventId] = useState(0);
   const [showReminderPanel, setShowReminderPanel] = useState(false);
   const lastEventIdRef = useRef(0);
+  const processedEventIdsRef = useRef(new Set());
+  const reminderPollInFlightRef = useRef(false);
   const [showReminders, setShowReminders] = useState(false);
   const [reminderListVersion, setReminderListVersion] = useState(0);
   const sayRef = useRef(null);
@@ -148,21 +151,27 @@ export default function App() {
     };
   }, []);
 
-  // Load every reminder that has fired, then watch for new ones.
+  // Load reminder history once, then announce each newly fired event only once.
   useEffect(() => {
     let cancelled = false;
     let initialised = false;
 
     async function pollFiredReminders() {
+      // Prevent overlapping requests from processing the same event twice.
+      if (reminderPollInFlightRef.current) return;
+      reminderPollInFlightRef.current = true;
+
       try {
         const response = await fetch(
           `${API_BASE}/api/reminders/events?after_id=${lastEventIdRef.current}&limit=200`
         );
         if (!response.ok || cancelled) return;
-        const data = await response.json();
-        const events = data.events || [];
 
-        // First successful load: show history silently, don't re-announce old reminders.
+        const data = await response.json();
+        const events = Array.isArray(data.events) ? data.events : [];
+        const latestId = Number(data.latest_id) || 0;
+
+        // Initial load is history only: do not replay old reminders on page render.
         if (!initialised) {
           initialised = true;
           let stored = null;
@@ -171,43 +180,80 @@ export default function App() {
           } catch {
             // Storage may be unavailable.
           }
-          setSeenEventId(stored === null ? data.latest_id || 0 : Number(stored) || 0);
-          lastEventIdRef.current = data.latest_id || 0;
-          setFiredReminders([...events].reverse());
+
+          setSeenEventId(stored === null ? latestId : Number(stored) || 0);
+          for (const event of events) {
+            if (event?.id != null) processedEventIdsRef.current.add(Number(event.id));
+          }
+          lastEventIdRef.current = Math.max(
+            lastEventIdRef.current,
+            latestId,
+            ...events.map((event) => Number(event.id) || 0)
+          );
+          setFiredReminders(
+            [...events].reverse().filter((event, index, all) =>
+              all.findIndex((item) => String(item.id) === String(event.id)) === index
+            )
+          );
           return;
         }
 
-        if (!events.length) return;
-        lastEventIdRef.current = data.latest_id;
-        setReminderListVersion((v) => v + 1);
-        setFiredReminders((previous) => [...[...events].reverse(), ...previous]);
+        // Defensively deduplicate by database event ID, even if the API repeats rows.
+        const newEvents = events.filter((event) => {
+          if (event?.id == null) return false;
+          const id = Number(event.id);
+          if (processedEventIdsRef.current.has(id)) return false;
+          processedEventIdsRef.current.add(id);
+          return true;
+        });
 
-        setMessages((previous) => [
-          ...previous,
-          ...events.map((event) => ({
-            role: "assistant",
-            content: `⏰ Reminder: ${event.title}`,
-          })),
-        ]);
+        lastEventIdRef.current = Math.max(
+          lastEventIdRef.current,
+          latestId,
+          ...events.map((event) => Number(event.id) || 0)
+        );
 
-        const last = events[events.length - 1];
+        if (!newEvents.length || cancelled) return;
+
+        setReminderListVersion((version) => version + 1);
+        setFiredReminders((previous) => {
+          const byId = new Map(previous.map((event) => [String(event.id), event]));
+          for (const event of newEvents) byId.set(String(event.id), event);
+          return [...byId.values()].sort((a, b) => Number(b.id) - Number(a.id));
+        });
+
+        setMessages((previous) => {
+          const existingEventIds = new Set(
+            previous.map((message) => message.reminderEventId).filter(Boolean).map(String)
+          );
+          const additions = newEvents
+            .filter((event) => !existingEventIds.has(String(event.id)))
+            .map((event) => ({
+              id: `reminder-event-${event.id}`,
+              reminderEventId: event.id,
+              role: "assistant",
+              content: `⏰ Reminder: ${event.title}`,
+            }));
+          return additions.length ? [...previous, ...additions] : previous;
+        });
+
+        const last = newEvents[newEvents.length - 1];
         setReminderAlert({ title: last.title, firedAt: last.fired_at });
         setStatus(`Reminder: ${last.title}`);
         sayRef.current?.(
-          events.length === 1
+          newEvents.length === 1
             ? `Reminder: ${last.title}`
-            : `You have ${events.length} reminders: ${events.map((e) => e.title).join(", ")}`
+            : `You have ${newEvents.length} reminders: ${newEvents.map((event) => event.title).join(", ")}`
         );
 
-        // One native pop-up per reminder while the tab is visible
-        // (Firebase pushes cover the case where the tab is in the background).
+        // Show one native notification per newly processed event.
         try {
           if (
             "Notification" in window &&
             Notification.permission === "granted" &&
             document.visibilityState === "visible"
           ) {
-            events.forEach((event) => {
+            newEvents.forEach((event) => {
               new Notification("⏰ AURA Reminder", {
                 body: event.title,
                 icon: "/favicon.ico",
@@ -220,12 +266,14 @@ export default function App() {
           console.debug("Local notification failed:", error);
         }
       } catch (error) {
-        console.debug("Reminder poll failed:", error);
+        if (!cancelled) console.debug("Reminder poll failed:", error);
+      } finally {
+        reminderPollInFlightRef.current = false;
       }
     }
 
-    pollFiredReminders();
-    const timer = window.setInterval(pollFiredReminders, 5000);
+    void pollFiredReminders();
+    const timer = window.setInterval(() => void pollFiredReminders(), 5000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -1165,53 +1213,7 @@ say(reply);
               </span>
             </div>
 
-            <div className="messages" aria-live="polite">
-              {messages.map((msg, index) => (
-                <div
-                  key={`${index}-${msg.role}`}
-                  className={`message-row ${
-                    msg.role === "user" ? "user-row" : ""
-                  }`}
-                >
-                  <div
-                    className={`message-avatar ${
-                      msg.role === "user" ? "user-avatar" : ""
-                    }`}
-                  >
-                    {msg.role === "user" ? "Y" : <Bot size={17} />}
-                  </div>
-
-                  <div
-                    className={`message-bubble ${
-                      msg.role === "user" ? "user-bubble" : ""
-                    } ${msg.error ? "error-bubble" : ""}`}
-                  >
-                    <span className="message-name">
-                      {msg.role === "user" ? "YOU" : "AURA"}
-                    </span>
-                    <p>{msg.content}</p>
-                  </div>
-                </div>
-              ))}
-
-              {busy && (
-                <div className="message-row">
-                  <div className="message-avatar">
-                    <Bot size={17} />
-                  </div>
-                  <div className="message-bubble">
-                    <span className="message-name">AURA</span>
-                    <div className="typing">
-                      <i />
-                      <i />
-                      <i />
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div ref={bottomRef} />
-            </div>
+            <ChatMessages messages={messages} busy={busy} bottomRef={bottomRef} />
 
             {reminderDraft && (
               <section
