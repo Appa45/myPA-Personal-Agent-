@@ -461,7 +461,7 @@ recognition.onerror = (event) => {
     transcript: finalTranscript,
     hadRecognitionError,
   });
-  
+
     setListening(false);
     if (recognitionRef.current === recognition) recognitionRef.current = null;
 
@@ -728,12 +728,6 @@ async function sendMessage(text = input) {
       return;
     }
 
-    if (reminderDraftRef.current && /^(no|nope|cancel|cancel reminder|don't schedule it|do not schedule it)$/i.test(spoken)) {
-      setInput("");
-      setMessages((previous) => [...previous, { role: "user", content: message }]);
-      cancelVoiceReminder();
-      return;
-    }
 
     // Route reminder commands to the reminder preview flow.
     // const isReminderCommand =
@@ -749,9 +743,151 @@ async function sendMessage(text = input) {
     //   return;
     // }
 
+    // Route reminder queries and day-planning requests BEFORE reminder creation.
+    // These commands read existing reminders; they must not call the preview parser.
+    const normalizedActionMessage = message.toLowerCase().trim();
+
+    const isPlanMyDayCommand =
+      /\b(?:plan my day|help me plan my day|plan my schedule|organize my day|organise my day)\b/i.test(
+        normalizedActionMessage
+      );
+
+    const isListRemindersCommand =
+      /\b(?:show|list|get|view|check|display|what|what are|what's|whats|upcoming|do i have)\b/i.test(
+        normalizedActionMessage
+      ) && /\b(?:reminders?|scheduled reminders?)\b/i.test(normalizedActionMessage) &&
+      !isPlanMyDayCommand;
+
+    // Load saved reminders using the existing GET endpoint.
+    async function fetchUpcomingReminders() {
+      const response = await fetch(`${API_BASE}/api/reminders`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+
+      const responseText = await response.text();
+      let data = [];
+
+      if (responseText.trim()) {
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          throw new Error("The reminders API returned invalid JSON.");
+        }
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          formatApiError(data, `Could not load reminders (HTTP ${response.status}).`)
+        );
+      }
+
+      const rows = Array.isArray(data)
+        ? data
+        : data.reminders || data.items || data.results || data.jobs || [];
+
+      if (!Array.isArray(rows)) {
+        throw new Error("The reminders API response does not contain a reminder list.");
+      }
+
+      const now = Date.now();
+      return rows
+        .map((reminder) => {
+          const dueAt =
+            reminder.due_at ||
+            reminder.scheduled_at ||
+            reminder.remind_at ||
+            reminder.datetime ||
+            reminder.next_run_time ||
+            reminder.nextRunTime;
+          return { reminder, dueAt, timestamp: dueAt ? new Date(dueAt).getTime() : NaN };
+        })
+        .filter(({ reminder, timestamp }) => {
+          if (!Number.isFinite(timestamp) || timestamp < now) return false;
+          const status = String(reminder.status || "").toLowerCase();
+          return !["completed", "cancelled", "canceled", "fired", "done"].includes(status);
+        })
+        .sort((a, b) => a.timestamp - b.timestamp);
+    }
+
+    async function handleReminderReadAction(action) {
+      setInput("");
+      setMessages((previous) => [...previous, { role: "user", content: message }]);
+      setBusy(true);
+      setStatus(action === "plan" ? "Planning your day…" : "Loading upcoming reminders…");
+
+      try {
+        const upcoming = await fetchUpcomingReminders();
+        let reply;
+
+        if (action === "plan") {
+          if (upcoming.length === 0) {
+            reply =
+              "You don't have any upcoming reminders to plan around. Tell me your tasks and priorities, and I can help organize your day.";
+          } else {
+            reply =
+              "Here's your day plan based on your upcoming reminders:\n\n" +
+              upcoming
+                .map(({ reminder, dueAt }, index) => {
+                  const title = reminder.title || reminder.name || reminder.body || "Reminder";
+                  const dateText = new Date(dueAt).toLocaleString("en-IN", {
+                    timeZone: reminder.timezone || "Asia/Kolkata",
+                    dateStyle: "medium",
+                    timeStyle: "short",
+                  });
+                  return `${index + 1}. ${dateText} — ${title}`;
+                })
+                .join("\n") +
+              "\n\nSuggestion: handle time-sensitive tasks first and leave buffer time between activities.";
+          }
+        } else if (upcoming.length === 0) {
+          reply = "You don't have any upcoming reminders.";
+        } else {
+          reply =
+            "Your upcoming reminders:\n\n" +
+            upcoming
+              .map(({ reminder, dueAt }, index) => {
+                const title = reminder.title || reminder.name || reminder.body || "Reminder";
+                const dateText = new Date(dueAt).toLocaleString("en-IN", {
+                  timeZone: reminder.timezone || "Asia/Kolkata",
+                  dateStyle: "medium",
+                  timeStyle: "short",
+                });
+                return `${index + 1}. ${title} — ${dateText}`;
+              })
+              .join("\n");
+        }
+
+        setMessages((previous) => [...previous, { role: "assistant", content: reply }]);
+        setReminderListVersion((version) => version + 1);
+        setStatus(action === "plan" ? "Day plan ready" : "Reminders loaded");
+        say(reply);
+      } catch (error) {
+        console.error(`[AURA] ${action === "plan" ? "Plan my day" : "List reminders"} failed:`, error);
+        const errorMessage = error.message || "Could not load your reminders.";
+        setMessages((previous) => [
+          ...previous,
+          { role: "assistant", content: errorMessage, error: true },
+        ]);
+        setStatus(action === "plan" ? "Could not plan your day" : "Could not load reminders");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    if (isPlanMyDayCommand) {
+      await handleReminderReadAction("plan");
+      return;
+    }
+
+    if (isListRemindersCommand) {
+      await handleReminderReadAction("list");
+      return;
+    }
+
     // Detect reminders expressed in natural language,
-// even when the user doesn't say "reminder".
-const isReminderCommand = isNaturalLanguageReminder(message);
+    // even when the user doesn't say "reminder".
+    const isReminderCommand = isNaturalLanguageReminder(message);
 
 console.log(
   "[AURA] Heard:",
@@ -774,6 +910,7 @@ if (isReminderCommand) {
 
   // Handle a test notification command locally, without calling the AI backend.
   const normalizedMessage = message.toLowerCase();
+
   const isTestNotificationCommand =
     normalizedMessage.includes("test notification") ||
     normalizedMessage.includes("send me a notification") ||
@@ -918,6 +1055,136 @@ say(reply);
     <div className="aura-dashboard">
 
 
+      <style>{`
+        /* Compact voice controls so the conversation gets the most space. */
+        .aura-dashboard .aura-hero {
+          gap: 14px;
+          min-width: 0;
+        }
+        .aura-dashboard .aura-orb-zone {
+          min-height: 96px;
+          height: 96px;
+          margin: 0 auto;
+          transform: scale(0.78);
+          transform-origin: center;
+        }
+        .aura-dashboard .aura-orb-button {
+          width: 68px !important;
+          height: 68px !important;
+          min-width: 68px !important;
+          min-height: 68px !important;
+        }
+        .aura-dashboard .aura-orb-button svg {
+          width: 30px;
+          height: 30px;
+        }
+        .aura-dashboard .aura-tap {
+          margin-top: -10px;
+          font-size: 12px;
+        }
+        .aura-dashboard .aura-quick-grid {
+          gap: 8px;
+        }
+        .aura-dashboard .aura-quick {
+          min-height: 66px;
+          padding: 10px 12px;
+          gap: 4px;
+        }
+        .aura-dashboard .aura-quick svg {
+          width: 17px;
+          height: 17px;
+        }
+        .aura-dashboard .aura-quick strong {
+          font-size: 12px;
+        }
+        .aura-dashboard .aura-quick span {
+          font-size: 11px;
+        }
+        .aura-dashboard .aura-chat-window {
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+          width: 100%;
+          min-height: 260px;
+          max-height: min(42vh, 440px);
+          overflow-y: auto;
+          padding: 18px;
+          border: 1px solid rgba(148, 174, 220,  0.22);
+          border-radius: 18px;
+          background: rgba(7, 16, 35,  0.58);
+          text-align: left;
+          scroll-behavior: smooth;
+          overflow-wrap: anywhere;
+        }
+        .aura-dashboard .aura-chat-window-heading {
+          position: sticky;
+          top: -18px;
+          z-index: 1;
+          margin: -18px -18px 2px;
+          padding: 13px 18px;
+          border-bottom: 1px solid rgba(148, 174, 220, 0.16);
+          background: rgba(7, 16, 35, 0.96);
+          color: #dce8ff;
+          font-size: 14px;
+          font-weight: 700;
+        }
+        .aura-dashboard .aura-chat-message {
+          max-width: 88%;
+          padding: 12px 15px;
+          border-radius: 14px;
+          color: #edf4ff;
+          font-size: 15px;
+          line-height: 1.65;
+          white-space: pre-wrap;
+        }
+        .aura-dashboard .aura-chat-message.assistant {
+          align-self: flex-start;
+          background: rgba(38, 57, 91, 0.78);
+          border: 1px solid rgba(148, 174, 220, 0.16);
+        }
+        .aura-dashboard .aura-chat-message.user {
+          align-self: flex-end;
+          background: linear-gradient(135deg, #2857b8, #4c70d8);
+          color: #fff;
+        }
+        .aura-dashboard .aura-chat-message-label {
+          display: block;
+          margin-bottom: 5px;
+          color: #a9c7f3;
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+        }
+        .aura-dashboard .aura-chat-message.user .aura-chat-message-label {
+          color: #dce7ff;
+        }
+        .aura-dashboard .aura-composer {
+          width: 100%;
+          min-height: 58px;
+        }
+        .aura-dashboard .aura-composer input {
+          min-width: 0;
+          font-size: 16px;
+        }
+        @media (max-width: 700px) {
+          .aura-dashboard .aura-chat-window {
+            min-height: 220px;
+            max-height: 38vh;
+            padding: 13px;
+          }
+          .aura-dashboard .aura-chat-window-heading {
+            top: -13px;
+            margin: -13px -13px 2px;
+            padding: 11px 13px;
+          }
+          .aura-dashboard .aura-chat-message {
+            max-width: 96%;
+            font-size: 14px;
+            padding: 10px 12px;
+          }
+        }
+      `}</style>
       <div className="aura-sunset" aria-hidden="true" />
       <div className="aura-skyline" aria-hidden="true" />
 
@@ -957,7 +1224,7 @@ say(reply);
           <div className="aura-orb-zone">
             <div className="aura-orb-halo" />
             <div className="aura-wave" aria-hidden="true" />
-            <button className={`aura-orb-button ${listening ? "listening" : ""}`} type="button" onClick={toggleMic} aria-label={voiceMode ? "Stop voice assistant" : "Start voice assistant"} aria-pressed={voiceMode}><Mic size={48} strokeWidth={1.8} /></button>
+            <button className={`aura-orb-button ${listening ? "listening" : ""}`} type="button" onClick={toggleMic} aria-label={voiceMode ? "Stop voice assistant" : "Start voice assistant"} aria-pressed={voiceMode}><Mic size={30} strokeWidth={1.8} /></button>
             <div className="aura-wave right" aria-hidden="true" />
           </div>
           <div className="aura-tap">{listening ? "Listening… speak now" : voiceMode ? "Voice mode active · tap to stop" : "Tap to speak"}</div>
@@ -969,9 +1236,27 @@ say(reply);
             <button className="aura-quick" type="button" onClick={() => sendMessage("Show my upcoming reminders")}><Bell color="#ff6677" /><strong>Upcoming reminders</strong><span>Check what is next</span></button>
           </div>
 
-          <div className="aura-chat-peek" aria-live="polite">
-            {busy ? <span><strong>AURA:</strong> Thinking…</span> : messages.length > 1 ? <><strong>{messages[messages.length - 1]?.role === "user" ? "You" : "AURA"}:</strong> {messages[messages.length - 1]?.content}</> : <span><strong>AURA:</strong> Try: set a reminder, draft an email, read my emails, or summarize an inbox.</span>}
-          </div>
+          <section className="aura-chat-window" aria-label="Conversation with AURA" aria-live="polite">
+            <div className="aura-chat-window-heading">Conversation</div>
+            {messages.map((message, index) => (
+              <article
+                className={`aura-chat-message ${message.role === "user" ? "user" : "assistant"}`}
+                key={message.id || `${message.role}-${index}`}
+              >
+                <span className="aura-chat-message-label">
+                  {message.role === "user" ? "You" : "AURA"}
+                </span>
+                <span>{message.content}</span>
+              </article>
+            ))}
+            {busy && (
+              <article className="aura-chat-message assistant">
+                <span className="aura-chat-message-label">AURA</span>
+                <span>Thinking…</span>
+              </article>
+            )}
+            <div ref={bottomRef} />
+          </section>
 
           <form className="aura-composer" onSubmit={(event) => { event.preventDefault(); sendMessage(); }}>
             <Sparkles size={18} color="#c3d5ff" />
