@@ -342,11 +342,15 @@ def test_notification(payload: TestNotificationRequest):
 # -------------------- Scheduled Reminders --------------------
 
 
+
 @app.post("/api/reminders")
 def create_reminder(payload: ReminderRequest):
-    """Schedule a one-time reminder."""
+    """Schedule a one-time reminder and log the precise failure."""
+
+    stage = "validation"
 
     try:
+        # 1. Validate and normalize the scheduled date/time.
         due_at = normalize_due_at(payload.due_at)
 
         if due_at is None:
@@ -355,16 +359,28 @@ def create_reminder(payload: ReminderRequest):
         if due_at.tzinfo is None or due_at.utcoffset() is None:
             raise ValueError("Reminder datetime must be timezone-aware")
 
+        stage = "scheduler_status"
+
         logging.info(
-            "Creating reminder: title=%r, due_at=%s, scheduler_running=%s",
+            "Reminder request received: title=%r, due_at=%s, "
+            "scheduler_running=%s",
             payload.title,
             due_at.isoformat(),
             scheduler.running,
         )
 
+        # APScheduler must be started before relying on its job store.
+        if not scheduler.running:
+            raise RuntimeError(
+                "APScheduler is not running. Start it during application "
+                "startup, or use a persistent external scheduling service."
+            )
+
+        stage = "add_job"
+
         reminder_id = f"aura-reminder-{uuid.uuid4().hex}"
 
-        scheduler.add_job(
+        job = scheduler.add_job(
             deliver_reminder,
             trigger=DateTrigger(run_date=due_at),
             args=[
@@ -379,65 +395,43 @@ def create_reminder(payload: ReminderRequest):
             misfire_grace_time=3600,
         )
 
-        job = scheduler.get_job(reminder_id)
+        stage = "verify_job"
 
         if job is None:
-            raise RuntimeError(
-                "Scheduler did not return the newly created reminder job"
-            )
+            raise RuntimeError("scheduler.add_job returned no job")
+
+        logging.info(
+            "Reminder scheduled: id=%s, next_run_time=%s",
+            reminder_id,
+            job.next_run_time,
+        )
 
         return {
             "success": True,
             "id": reminder_id,
             "title": payload.title,
-            "due_at": job.next_run_time.isoformat(),
+            "due_at": (
+                job.next_run_time.isoformat()
+                if job.next_run_time
+                else due_at.isoformat()
+            ),
             "timezone": str(LOCAL_TIMEZONE),
             "message": "Reminder scheduled successfully.",
         }
 
     except Exception as exc:
         logging.exception(
-            "Could not schedule reminder: %s",
-            str(exc),
+            "Reminder creation failed at stage=%s: %s",
+            stage,
+            exc,
         )
 
         raise HTTPException(
             status_code=500,
-            detail="Could not schedule reminder. Check scheduler configuration.",
+            detail=f"Reminder creation failed at stage: {stage}. "
+                   "Check the backend runtime logs.",
         ) from exc
 
-    """
-    Schedule a one-time reminder.
-    Send due_at as ISO 8601 with timezone, e.g. 2026-10-22T09:00:00+05:30.
-    """
-    due_at = normalize_due_at(payload.due_at)
-    reminder_id = f"aura-reminder-{uuid.uuid4().hex}"
-
-    try:
-        scheduler.add_job(
-            deliver_reminder,
-            trigger=DateTrigger(run_date=due_at, timezone=LOCAL_TIMEZONE),
-            args=[payload.title, payload.body, payload.token, payload.url],
-            id=reminder_id,
-            name=payload.title,
-            replace_existing=False,
-            misfire_grace_time=3600,
-        )
-    except Exception as exc:
-        logging.exception("Could not schedule reminder")
-        raise HTTPException(
-            status_code=500,
-            detail="Could not schedule reminder. Check scheduler configuration.",
-        ) from exc
-
-    return {
-        "success": True,
-        "id": reminder_id,
-        "title": payload.title,
-        "due_at": due_at.isoformat(),
-        "timezone": str(LOCAL_TIMEZONE),
-        "message": "Reminder scheduled successfully.",
-    }
 
 
 @app.get("/api/reminders")
