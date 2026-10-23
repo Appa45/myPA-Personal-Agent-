@@ -1,0 +1,5 @@
+
+User-agent: *
+Allow: /
+
+Sitemap: https://frontend-mu-dusky-23.vercel.app/sitemap.xml
