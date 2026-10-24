@@ -37,6 +37,8 @@ export default function EmailScheduler({ apiBase }) {
   const [body, setBody] = useState("");
   const [sendAt, setSendAt] = useState(localDateTimeValue());
   const [emails, setEmails] = useState([]);
+  const [drafts, setDrafts] = useState([]);
+  const [savedDraftId, setSavedDraftId] = useState(null);
   const [loading, setLoading] = useState(false);
   const [drafting, setDrafting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -59,13 +61,15 @@ export default function EmailScheduler({ apiBase }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [settings, scheduled] = await Promise.all([
+      const [settings, scheduled, savedDrafts] = await Promise.all([
         request("/api/email/settings"),
         request("/api/email/scheduled"),
+        request("/api/email/drafts"),
       ]);
       setRecipient(settings.recipient || "");
       setConfigured(Boolean(settings.configured));
       setEmails(scheduled.emails || []);
+      setDrafts(savedDrafts.drafts || []);
       setError("");
     } catch (err) {
       setError(err.message || "Could not load scheduled emails.");
@@ -94,7 +98,8 @@ export default function EmailScheduler({ apiBase }) {
       setSubject(data.subject || "");
       setBody(data.body || "");
       setEditingId(null);
-      setNotice("Draft generated. Review and edit it before scheduling.");
+      setSavedDraftId(null);
+      setNotice("Draft generated. Review it, then save it or schedule it.");
     } catch (err) {
       setError(err.message || "Could not generate a draft.");
     } finally {
@@ -102,7 +107,67 @@ export default function EmailScheduler({ apiBase }) {
     }
   }
 
+  async function saveDraft() {
+    setError("");
+    setNotice("");
+    if (!subject.trim() || !body.trim()) {
+      setError("Add a subject and email body before saving the draft.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const payload = {
+        subject: subject.trim(),
+        body: body.trim(),
+        instruction: instruction.trim(),
+        recipient: recipient || undefined,
+      };
+      const path = savedDraftId
+        ? `/api/email/drafts/${encodeURIComponent(savedDraftId)}`
+        : "/api/email/drafts";
+      const result = await request(path, {
+        method: savedDraftId ? "PATCH" : "POST",
+        body: JSON.stringify(payload),
+      });
+      const draft = result.draft;
+      setSavedDraftId(draft?.id || savedDraftId || null);
+      setNotice(savedDraftId ? "Saved draft updated." : "Email draft saved.");
+      const response = await request("/api/email/drafts");
+      setDrafts(response.drafts || []);
+    } catch (err) {
+      setError(err.message || "Could not save email draft.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function editSavedDraft(item) {
+    setSavedDraftId(item.id);
+    setEditingId(null);
+    setInstruction(item.instruction || "");
+    setSubject(item.subject || "");
+    setBody(item.body || "");
+    setNotice("Saved draft loaded. Edit it, update the saved draft, or schedule it.");
+    setError("");
+    window.scrollTo?.({ top: 0, behavior: "smooth" });
+  }
+
+  async function deleteSavedDraft(item) {
+    if (!window.confirm(`Delete saved draft "${item.subject}"?`)) return;
+    setError("");
+    setNotice("");
+    try {
+      await request(`/api/email/drafts/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+      setDrafts((current) => current.filter((draft) => draft.id !== item.id));
+      if (savedDraftId === item.id) setSavedDraftId(null);
+      setNotice("Saved draft deleted.");
+    } catch (err) {
+      setError(err.message || "Could not delete saved draft.");
+    }
+  }
+
   function editScheduledEmail(item) {
+    setSavedDraftId(null);
     setEditingId(item.id);
     setSubject(item.subject || "");
     setBody(item.body || "");
@@ -144,6 +209,7 @@ export default function EmailScheduler({ apiBase }) {
         setNotice("Email scheduled. AURA will send it at the selected time.");
       }
       setEditingId(null);
+      setSavedDraftId(null);
       setInstruction("");
       setSubject("");
       setBody("");
@@ -171,6 +237,7 @@ export default function EmailScheduler({ apiBase }) {
 
   function clearDraft() {
     setEditingId(null);
+    setSavedDraftId(null);
     setInstruction("");
     setSubject("");
     setBody("");
@@ -203,7 +270,7 @@ export default function EmailScheduler({ apiBase }) {
       {(subject || body || editingId) && (
         <form onSubmit={schedule} style={{ display: "grid", gap: 9, borderTop: "1px solid #e5e7eb", paddingTop: 14, marginBottom: 18 }}>
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-            <strong>{editingId ? "Edit scheduled email" : "Review your draft"}</strong>
+            <strong>{editingId ? "Edit scheduled email" : savedDraftId ? "Edit saved draft" : "Review your draft"}</strong>
             <button type="button" style={buttonStyle} onClick={clearDraft} title="Clear draft"><X size={14} /> Clear</button>
           </div>
           <label style={{ fontSize: 13, fontWeight: 700 }} htmlFor="aura-email-subject">Subject</label>
@@ -213,12 +280,38 @@ export default function EmailScheduler({ apiBase }) {
           <label style={{ fontSize: 13, fontWeight: 700 }} htmlFor="aura-email-send-at">Send date and time</label>
           <input id="aura-email-send-at" style={inputStyle} type="datetime-local" value={sendAt} min={minSendAt} onChange={(e) => setSendAt(e.target.value)} required />
           <small style={{ color: "#6b7280" }}>Time zone: {Intl.DateTimeFormat().resolvedOptions().timeZone || "local time"}. The email will be sent to the saved recipient above.</small>
-          <button type="submit" style={primaryStyle} disabled={saving || !configured}><CalendarClock size={16} />{saving ? "Saving…" : editingId ? "Save changes" : "Approve and schedule email"}</button>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            <button type="button" style={buttonStyle} onClick={saveDraft} disabled={saving || !subject.trim() || !body.trim()}><Mail size={15} />{saving ? "Saving…" : savedDraftId ? "Update saved draft" : "Save draft"}</button>
+            <button type="submit" style={primaryStyle} disabled={saving || !configured}><CalendarClock size={16} />{saving ? "Saving…" : editingId ? "Save schedule changes" : "Approve and schedule email"}</button>
+          </div>
         </form>
       )}
 
       {error && <div role="alert" style={{ padding: 10, margin: "10px 0", background: "#fef2f2", border: "1px solid #fecaca", color: "#991b1b", borderRadius: 9, fontSize: 13 }}>{error}</div>}
       {notice && !error && <div role="status" style={{ padding: 10, margin: "10px 0", background: "#eff6ff", border: "1px solid #bfdbfe", color: "#1d4ed8", borderRadius: 9, fontSize: 13 }}>{notice}</div>}
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "18px 0 8px" }}>
+        <strong>Saved drafts ({drafts.length})</strong>
+      </div>
+      {drafts.length === 0 && <p style={{ color: "#6b7280", fontSize: 13 }}>No saved drafts yet. Generate an email and choose Save draft.</p>}
+      <div style={{ display: "grid", gap: 8, marginBottom: 18 }}>
+        {drafts.map((item) => (
+          <article key={item.id} style={{ border: "1px solid #e5e7eb", borderRadius: 11, padding: 11, background: "#fff" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+              <div style={{ minWidth: 0, overflowWrap: "anywhere" }}>
+                <strong style={{ fontSize: 13 }}>{item.subject}</strong>
+                <div style={{ color: "#6b7280", fontSize: 12, marginTop: 4 }}>Updated {showDate(item.updated_at)}</div>
+                {item.recipient && <div style={{ color: "#6b7280", fontSize: 12, marginTop: 3 }}>To: {item.recipient}</div>}
+                <p style={{ color: "#374151", fontSize: 12, whiteSpace: "pre-wrap", margin: "8px 0 0", maxHeight: 80, overflow: "hidden" }}>{item.body}</p>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                <button type="button" style={buttonStyle} onClick={() => editSavedDraft(item)} title="Edit saved draft"><Pencil size={14} /></button>
+                <button type="button" style={dangerStyle} onClick={() => deleteSavedDraft(item)} title="Delete saved draft"><Trash2 size={14} /></button>
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "14px 0 6px" }}>
         <strong>Upcoming emails ({emails.length})</strong>

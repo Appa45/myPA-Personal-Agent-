@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { Component, useEffect, useRef, useState } from "react";
 import "./App.css";
 import {
   Activity,
@@ -9,6 +9,7 @@ import {
   Mail,
   Inbox,
   ChevronRight,
+  ContactRound,
   MicOff,
   Send,
   ShieldCheck,
@@ -20,6 +21,8 @@ import NotificationSettings from "./components/NotificationSettings";
 import RemindersManager from "./components/RemindersManager";
 import EmailScheduler from "./EmailScheduler";
 import { enableNotifications } from "./firebase";
+
+import ContactsManager from "./components/ContactsManager";
 // import Testtoken from "./TokenTest"
 
 const API_BASE =
@@ -89,6 +92,140 @@ function isNaturalLanguageReminder(message) {
   return futureTime && taskIntent;
 }
 
+function isEmailCompositionCommand(message) {
+  const text = message.trim();
+  const asksToCompose =
+    /\b(?:send|draft|write|compose|create)\b.{0,50}\b(?:an?\s+)?e-?mail\b/i.test(text) ||
+    /\b(?:e-?mail)\s+to\s+[\w]/i.test(text);
+  const asksToRead =
+    /\b(?:read|check|fetch|retrieve|pull|summari[sz]e|show|get|list)\b.{0,35}\b(?:my\s+)?(?:latest|recent|inbox|emails?)\b/i.test(text);
+  return asksToCompose && !asksToRead;
+}
+
+function isBulkEmailCommand(message) {
+  const text = message.trim();
+  const targetsAllContacts =
+    /\b(?:all|every|each)\s+(?:of\s+)?(?:my\s+)?(?:saved\s+)?contacts\b/i.test(text) ||
+    /\b(?:all|every)\s+(?:of\s+)?(?:my\s+)?(?:saved\s+)?contact\s+(?:emails|email addresses)\b/i.test(text);
+  const isEmailAction =
+    /\b(?:send|draft|write|compose|create|email|message)\b/i.test(text) &&
+    /\b(?:email|e-mail|message|contacts?)\b/i.test(text);
+  return targetsAllContacts && isEmailAction;
+}
+
+function extractBulkEmailInstruction(command) {
+  let instruction = command.trim();
+
+  // Remove the command and audience, preserving the actual message details.
+  instruction = instruction.replace(
+    /^\s*(?:please\s+)?(?:send|draft|write|compose|create)\s+(?:me\s+)?(?:an?\s+)?e-?mail\s+to\s+(?:all|every|each)\s+(?:of\s+)?(?:my\s+)?(?:saved\s+)?contacts?\s*/i,
+    ""
+  );
+  instruction = instruction.replace(
+    /^\s*(?:please\s+)?(?:email|message)\s+(?:all|every|each)\s+(?:of\s+)?(?:my\s+)?(?:saved\s+)?contacts?\s*/i,
+    ""
+  );
+  instruction = instruction.replace(/^\s*(?:saying|that|with the message|message is|message:)\s*/i, "").trim();
+
+  // If the command includes an explicit subject, separate it from the body.
+  const subjectMatch = instruction.match(/^\s*(?:subject|with subject)\s*[:\-]\s*(.+?)(?:\s+\b(?:saying|message|body)\b\s*[:\-]?\s*|\n)([\s\S]*)$/i);
+  if (subjectMatch) {
+    return {
+      subject: subjectMatch[1].trim().slice(0, 200) || "Message to all contacts",
+      bodyInstruction: subjectMatch[2].trim(),
+    };
+  }
+
+  instruction = instruction.replace(/^\s*(?:about|regarding)\s+/i, "I wanted to share an update regarding ");
+  if (!instruction) {
+    return {
+      subject: "Message to all contacts",
+      bodyInstruction: "",
+    };
+  }
+
+  const lower = instruction.toLowerCase();
+  let subject = "Message to all contacts";
+  if (/\b(meeting|call|interview)\b/.test(lower)) subject = "Meeting Update";
+  else if (/\b(reschedule|postpone|schedule change)\b/.test(lower)) subject = "Scheduling Update";
+  else if (/\b(announcement|update|information)\b/.test(lower)) subject = "Important Update";
+
+  return { subject, bodyInstruction: instruction };
+}
+
+function extractContactEmailInstruction(command) {
+  const text = command.trim();
+  // Accept "send an email to Salu saying ...", "email to Salu about ...",
+  // and "draft an email to Salu that ...".
+  const contactMatch = text.match(
+    /\b(?:e-?mail|message)\s+to\s+(.+?)(?=\s+\b(?:saying|that|about|regarding|with subject|subject|to say|tell them|asking|ask|requesting)\b|[,;]|$)/i
+  );
+
+  if (!contactMatch?.[1]) {
+    return {
+      contactName: "",
+      instruction: "",
+    };
+  }
+
+  const contactName = contactMatch[1]
+    .replace(/^(?:my\s+saved\s+contact|the\s+contact|contact)\s+/i, "")
+    .trim();
+
+  if (/^(?:my saved recipient|my contact|saved contact|my saved contact|recipient|contact)$/i.test(contactName)) {
+    return { contactName: "", instruction: "" };
+  }
+
+  let instruction = text
+    .replace(/\b(?:send|draft|write|compose|create)\s+(?:me\s+)?(?:an?\s+)?e-?mail\s+to\s+/i, "")
+    .replace(/\b(?:e-?mail|message)\s+to\s+/i, "");
+
+  instruction = instruction.replace(
+    new RegExp(`^${contactName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*`, "i"),
+    ""
+  );
+  instruction = instruction.replace(/^\s*(?:saying|that|to say)\s+/i, "").trim();
+  instruction = instruction.replace(/^\s*(?:about|regarding)\s+/i, "About ");
+  if (!instruction) {
+    instruction = "Draft a suitable email. Ask me for the email details if needed.";
+  }
+
+  return { contactName, instruction };
+}
+
+class ContactsManagerErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false };
+  }
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error) {
+    console.error("Contacts Manager render error:", error);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{ padding: 20, color: "#f4f5f7", background: "#151821", borderRadius: 14 }}>
+          <h2 style={{ marginTop: 0 }}>Contacts could not be displayed</h2>
+          <p style={{ color: "#b7bdcc" }}>
+            The Contacts component encountered a rendering error. Check the browser console and
+            confirm that ./components/ContactsManager.jsx and its CSS file exist.
+          </p>
+          <button type="button" onClick={() => this.setState({ hasError: false })}>
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
@@ -105,6 +242,10 @@ export default function App() {
   const [reminderDraft, setReminderDraft] = useState(null);
   const [reminderBusy, setReminderBusy] = useState(false);
   const [reminderNotice, setReminderNotice] = useState("");
+  const [emailDraft, setEmailDraft] = useState(null);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [emailNotice, setEmailNotice] = useState("");
+  const emailDraftRef = useRef(null);
   const voiceModeRef = useRef(false);
   // Ref mirrors reminderDraft so voice callbacks (created once) never see stale state.
   const reminderDraftRef = useRef(null);
@@ -706,6 +847,250 @@ function sendTestNotification() {
     setStatus("Reminder cancelled");
   }
 
+  function updateEmailDraft(draft) {
+    emailDraftRef.current = draft;
+    setEmailDraft(draft);
+  }
+
+  async function prepareBulkEmailDraft(command) {
+    setEmailBusy(true);
+    setEmailNotice("");
+
+    try {
+      const contactsResponse = await fetch(`${API_BASE}/api/contacts`, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+      const contactsText = await contactsResponse.text();
+      let contactsData = {};
+      if (contactsText.trim()) {
+        try {
+          contactsData = JSON.parse(contactsText);
+        } catch {
+          throw new Error(`Contacts API returned invalid JSON (HTTP ${contactsResponse.status}).`);
+        }
+      }
+      if (!contactsResponse.ok) {
+        throw new Error(formatApiError(contactsData, "Could not load saved contacts."));
+      }
+
+      const contacts = Array.isArray(contactsData)
+        ? contactsData
+        : contactsData.contacts || contactsData.items || [];
+      if (!Array.isArray(contacts) || contacts.length === 0) {
+        throw new Error("You don't have any saved contacts with email addresses yet. Add contacts first.");
+      }
+
+      const recipients = contacts.filter(
+        (contact) => typeof contact.email === "string" && contact.email.trim()
+      );
+      if (recipients.length === 0) {
+        throw new Error("None of your saved contacts has an email address.");
+      }
+
+      const { subject, bodyInstruction } = extractBulkEmailInstruction(command);
+      const body = bodyInstruction
+        ? `Hello everyone,\n\n${bodyInstruction.charAt(0).toUpperCase()}${bodyInstruction.slice(1)}\n\nBest regards`
+        : "Hello everyone,\n\n[Please add the message you want to send to all contacts.]\n\nBest regards";
+
+      const draft = {
+        isBulk: true,
+        contact_name: "All saved contacts",
+        recipient_count: recipients.length,
+        subject,
+        body,
+        instruction: bodyInstruction,
+      };
+      updateEmailDraft(draft);
+
+      const confirmation =
+        `I've prepared a bulk email draft for ${recipients.length} saved contact${recipients.length === 1 ? "" : "s"}. Review the subject and message below, then choose Send email to send a separate email to each contact. Nothing will be sent until you confirm.`;
+      setEmailNotice(confirmation);
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          content: `${confirmation}\n\nSubject: ${draft.subject}\n\n${draft.body}`,
+        },
+      ]);
+      setStatus("Bulk email draft ready for review");
+      say(confirmation);
+    } catch (error) {
+      console.error("Bulk email draft failed:", error);
+      const errorMessage = error.message || "Could not prepare the bulk email draft.";
+      setEmailNotice(errorMessage);
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", content: errorMessage, error: true },
+      ]);
+      setStatus("Could not prepare bulk email");
+      say(errorMessage);
+    } finally {
+      setEmailBusy(false);
+    }
+  }
+
+  async function prepareContactEmailDraft(command) {
+    const { contactName, instruction } = extractContactEmailInstruction(command);
+
+    if (!contactName) {
+      const reply =
+        "I can draft that email, but I couldn't identify the saved contact name. Please say: “Send an email to Salu saying …” using the exact name saved in Contacts.";
+      setEmailNotice(reply);
+      setMessages((previous) => [...previous, { role: "assistant", content: reply }]);
+      setStatus("Contact name needed");
+      say(reply);
+      return;
+    }
+
+    setEmailBusy(true);
+    setEmailNotice("");
+    try {
+      const response = await fetch(`${API_BASE}/api/email/draft-to-contact`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          contact_name: contactName,
+          instruction,
+        }),
+      });
+
+      const responseText = await response.text();
+      let data = {};
+      if (responseText.trim()) {
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          throw new Error(`Email draft API returned invalid JSON (HTTP ${response.status}).`);
+        }
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          formatApiError(data, `Could not draft the email (HTTP ${response.status}).`)
+        );
+      }
+
+      if (!data.subject || !data.body) {
+        throw new Error("The email draft endpoint did not return both a subject and a body.");
+      }
+
+      const draft = {
+        ...data,
+        contact_name: data.contact_name || contactName,
+        instruction,
+      };
+      updateEmailDraft(draft);
+
+      const confirmation =
+        `I've prepared an email draft for ${draft.contact_name}. Please review the subject and message, then choose Send email or Cancel. I won't send it until you confirm.`;
+      setEmailNotice(confirmation);
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "assistant",
+          content: `${confirmation}\n\nSubject: ${draft.subject}\n\n${draft.body}`,
+        },
+      ]);
+      setStatus("Email draft ready for review");
+      say(confirmation);
+    } catch (error) {
+      console.error("Contact email draft failed:", error);
+      const message = error.message || "Could not prepare the email draft.";
+      setEmailNotice(message);
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", content: message, error: true },
+      ]);
+      setStatus("Could not draft email");
+      say(message);
+    } finally {
+      setEmailBusy(false);
+    }
+  }
+
+  async function confirmContactEmailSend() {
+    const draft = emailDraftRef.current;
+    if (!draft || emailBusy) return;
+
+    setEmailBusy(true);
+    setEmailNotice("");
+    try {
+      const endpoint = draft.isBulk
+        ? `${API_BASE}/api/email/send-to-all-contacts`
+        : `${API_BASE}/api/email/send-to-contact`;
+      const payload = draft.isBulk
+        ? {
+            subject: draft.subject,
+            body: draft.body,
+            confirmed: true,
+          }
+        : {
+            contact_name: draft.contact_name,
+            subject: draft.subject,
+            body: draft.body,
+            confirmed: true,
+          };
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const responseText = await response.text();
+      let data = {};
+      if (responseText.trim()) {
+        try {
+          data = JSON.parse(responseText);
+        } catch {
+          throw new Error(`Email send API returned invalid JSON (HTTP ${response.status}).`);
+        }
+      }
+
+      if (!response.ok) {
+        throw new Error(formatApiError(data, `Could not send the email (HTTP ${response.status}).`));
+      }
+
+      const reply = draft.isBulk
+        ? (data.message ||
+          `Bulk email complete: ${Number(data.sent_count) || 0} sent, ${Number(data.failed_count) || 0} failed.`)
+        : (data.message || data.reply || `Email sent to ${draft.contact_name}.`);
+      updateEmailDraft(null);
+      setEmailNotice(reply);
+      setMessages((previous) => [...previous, { role: "assistant", content: reply }]);
+      setStatus("Email sent");
+      say(reply);
+    } catch (error) {
+      console.error("Sending contact email failed:", error);
+      const message = error.message || "Could not send the email.";
+      setEmailNotice(message);
+      setMessages((previous) => [
+        ...previous,
+        { role: "assistant", content: message, error: true },
+      ]);
+      setStatus("Email sending failed");
+      say(message);
+    } finally {
+      setEmailBusy(false);
+    }
+  }
+
+  function cancelContactEmailDraft() {
+    updateEmailDraft(null);
+    const reply = "Email draft cancelled. Nothing was sent.";
+    setEmailNotice(reply);
+    setStatus("Email draft cancelled");
+    setMessages((previous) => [...previous, { role: "assistant", content: reply }]);
+    say(reply);
+  }
+
 async function sendMessage(text = input) {
   const message = text.trim();
 
@@ -720,6 +1105,20 @@ async function sendMessage(text = input) {
     // Allow voice or text confirmation/cancellation for a pending reminder.
     // Speech recognition adds punctuation ("Yes."), so strip it before matching.
     const spoken = message.replace(/[.!?,]+$/g, "").trim();
+
+    if (emailDraftRef.current && /^(yes|yeah|yep|confirm|send|send it|confirm email|send email)$/i.test(spoken)) {
+      setInput("");
+      setMessages((previous) => [...previous, { role: "user", content: message }]);
+      await confirmContactEmailSend();
+      return;
+    }
+
+    if (emailDraftRef.current && /^(no|nope|cancel|cancel email|don't send|do not send)$/i.test(spoken)) {
+      setInput("");
+      setMessages((previous) => [...previous, { role: "user", content: message }]);
+      cancelContactEmailDraft();
+      return;
+    }
 
     if (reminderDraftRef.current && /^(yes|yeah|yep|confirm|confirm reminder|schedule it|yes schedule it)$/i.test(spoken)) {
       setInput("");
@@ -742,6 +1141,22 @@ async function sendMessage(text = input) {
     //   await prepareVoiceReminder(message);
     //   return;
     // }
+
+    // Email composition must be handled before reminder detection because an email
+    // mentioning a future meeting time should not become a reminder.
+    if (isEmailCompositionCommand(message) || isBulkEmailCommand(message)) {
+      setInput("");
+      setMessages((previous) => [...previous, { role: "user", content: message }]);
+
+      // Bulk-email intent must be checked first so "all my contacts" is never
+      // parsed as a single saved contact name.
+      if (isBulkEmailCommand(message)) {
+        await prepareBulkEmailDraft(message);
+      } else {
+        await prepareContactEmailDraft(message);
+      }
+      return;
+    }
 
     // Route reminder queries and day-planning requests BEFORE reminder creation.
     // These commands read existing reminders; they must not call the preview parser.
@@ -1185,6 +1600,7 @@ say(reply);
           }
         }
       `}</style>
+
       <div className="aura-sunset" aria-hidden="true" />
       <div className="aura-skyline" aria-hidden="true" />
 
@@ -1198,6 +1614,7 @@ say(reply);
           <button className={activeSidePanel === "actions" ? "active" : ""} type="button" onClick={() => setActiveSidePanel("actions")}><Sparkles size={19} /><span>AURA Actions</span></button>
           <button className={activeSidePanel === "reminders" ? "active" : ""} type="button" onClick={() => { setActiveSidePanel("reminders"); setShowReminders(false); loadReminderList(); }}><AlarmClock size={19} /><span>Reminders</span></button>
           <button className={activeSidePanel === "emails" ? "active" : ""} type="button" onClick={() => setActiveSidePanel("emails")}><Mail size={19} /><span>Scheduled Emails</span></button>
+          <button className={activeSidePanel === "contacts" ? "active" : ""} type="button" onClick={() => setActiveSidePanel("contacts")}><ContactRound size={19} /><span>Contacts</span></button>
         </nav>
         <div className="aura-notification-settings"><NotificationSettings /></div>
         <div className="aura-sidebar-spacer" />
@@ -1266,13 +1683,47 @@ say(reply);
           </form>
         </section>
 
+        {emailDraft && (
+          <section className="aura-confirm" aria-live="polite">
+            <h3>Review email draft</h3>
+            <p><strong>To:</strong> {emailDraft.isBulk
+              ? `All saved contacts (${emailDraft.recipient_count} recipients; each receives a separate email)`
+              : `${emailDraft.contact_name}${emailDraft.recipient ? ` (${emailDraft.recipient})` : ""}`}</p>
+            <p><strong>Subject:</strong> {emailDraft.subject}</p>
+            <p><strong>Message:</strong></p>
+            <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", padding: "12px", borderRadius: "10px", background: "rgba(7,16,35,0.55)", marginBottom: "14px" }}>{emailDraft.body}</div>
+            <p>{emailDraft.isBulk
+              ? `Review carefully: this will send the same message to ${emailDraft.recipient_count} contacts. Each recipient receives a separate email.`
+              : "Review the details before sending. The email will not be sent unless you confirm."}</p>
+            <div className="aura-confirm-actions">
+              <button type="button" onClick={confirmContactEmailSend} disabled={emailBusy}>
+                {emailBusy ? "Sending…" : "Send email"}
+              </button>
+              <button type="button" onClick={cancelContactEmailDraft} disabled={emailBusy}>Cancel</button>
+            </div>
+          </section>
+        )}
+        {emailNotice && !emailDraft && !emailBusy && (
+          <div className="aura-status-alert" role="status" style={{ top: "auto", bottom: 112 }}>
+            {emailNotice}
+          </div>
+        )}
         {reminderDraft && <section className="aura-confirm" aria-live="polite"><h3>Confirm reminder</h3><p><strong>Task:</strong> {reminderDraft.title}</p><p><strong>Date and time:</strong> {new Date(reminderDraft.due_at).toLocaleString("en-IN",{timeZone:reminderDraft.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || "Asia/Kolkata",dateStyle:"medium",timeStyle:"short"})}</p><div className="aura-confirm-actions"><button type="button" onClick={confirmVoiceReminder} disabled={reminderBusy}>{reminderBusy ? "Scheduling…" : "Confirm and schedule"}</button><button type="button" onClick={cancelVoiceReminder} disabled={reminderBusy}>Cancel</button></div></section>}
         {reminderNotice && !reminderDraft && !reminderBusy && <div className="aura-status-alert" role="status" style={{top:"auto",bottom:70}}>{reminderNotice}</div>}
       </main>
 
-      <aside className="aura-right aura-explore-panel" aria-label={activeSidePanel === "emails" ? "Scheduled emails" : activeSidePanel === "reminders" ? "Reminder list" : "AURA actions"}>
+      <aside className="aura-right aura-explore-panel" aria-label={activeSidePanel === "emails" ? "Scheduled emails" : activeSidePanel === "contacts" ? "Contacts" : activeSidePanel === "reminders" ? "Reminder list" : "AURA actions"}>
         {activeSidePanel === "emails" ? (
           <EmailScheduler apiBase={API_BASE} />
+        ) : activeSidePanel === "contacts" ? (
+          <div
+            className="contacts-panel-wrapper"
+            style={{ width: "100%", minWidth: 0, minHeight: 0, height: "100%", overflowY: "auto", padding: "16px", boxSizing: "border-box" }}
+          >
+            <ContactsManagerErrorBoundary>
+              <ContactsManager />
+            </ContactsManagerErrorBoundary>
+          </div>
         ) : activeSidePanel === "reminders" ? (
           <>
             <div className="aura-explore-title">
