@@ -29,6 +29,19 @@ function getError(data, fallback) {
   return fallback;
 }
 
+function parseRecipients(value) {
+  return [...new Set(
+    String(value || "")
+      .split(/[;,\\n]+/)
+      .map((email) => email.trim())
+      .filter(Boolean)
+  )];
+}
+
+function isValidEmailAddress(value) {
+  return /^[^\\s@,;]+@[^\\s@,;]+\\.[^\\s@,;]+$/.test(value);
+}
+
 export default function EmailScheduler({ apiBase }) {
   const [recipient, setRecipient] = useState("");
   const [configured, setConfigured] = useState(false);
@@ -92,7 +105,11 @@ export default function EmailScheduler({ apiBase }) {
     try {
       const data = await request("/api/email/draft", {
         method: "POST",
-        body: JSON.stringify({ instruction: instruction.trim() }),
+        body: JSON.stringify({
+          instruction: instruction.trim(),
+          recipient: recipient.trim(),
+          recipients: parseRecipients(recipient),
+        }),
       });
       setRecipient(data.recipient || recipient);
       setSubject(data.subject || "");
@@ -120,7 +137,8 @@ export default function EmailScheduler({ apiBase }) {
         subject: subject.trim(),
         body: body.trim(),
         instruction: instruction.trim(),
-        recipient: recipient || undefined,
+        recipient: recipient.trim() || undefined,
+        recipients: parseRecipients(recipient),
       };
       const path = savedDraftId
         ? `/api/email/drafts/${encodeURIComponent(savedDraftId)}`
@@ -145,6 +163,7 @@ export default function EmailScheduler({ apiBase }) {
     setSavedDraftId(item.id);
     setEditingId(null);
     setInstruction(item.instruction || "");
+    setRecipient((item.recipients || []).join(", ") || item.recipient || recipient);
     setSubject(item.subject || "");
     setBody(item.body || "");
     setNotice("Saved draft loaded. Edit it, update the saved draft, or schedule it.");
@@ -169,6 +188,7 @@ export default function EmailScheduler({ apiBase }) {
   function editScheduledEmail(item) {
     setSavedDraftId(null);
     setEditingId(item.id);
+    setRecipient((item.recipients || []).join(", ") || item.recipient || recipient);
     setSubject(item.subject || "");
     setBody(item.body || "");
     setSendAt(localDateTimeValue(item.send_at));
@@ -182,8 +202,14 @@ export default function EmailScheduler({ apiBase }) {
     event.preventDefault();
     setError("");
     setNotice("");
-    if (!configured || !recipient) {
-      setError("Configure AURA_SAVED_EMAIL in backend/.env first.");
+    const recipients = parseRecipients(recipient);
+    if (recipients.length === 0) {
+      setError("Enter at least one recipient email address.");
+      return;
+    }
+    const invalidRecipients = recipients.filter((email) => !isValidEmailAddress(email));
+    if (invalidRecipients.length > 0) {
+      setError(`Check these email address(es): ${invalidRecipients.join(", ")}`);
       return;
     }
     if (!subject.trim() || !body.trim() || !sendAt) {
@@ -198,7 +224,13 @@ export default function EmailScheduler({ apiBase }) {
 
     setSaving(true);
     try {
-      const payload = { subject: subject.trim(), body: body.trim(), send_at: due.toISOString() };
+      const payload = {
+        recipient: recipients[0],
+        recipients,
+        subject: subject.trim(),
+        body: body.trim(),
+        send_at: due.toISOString(),
+      };
       if (editingId) {
         await request(`/api/email/scheduled/${encodeURIComponent(editingId)}`, {
           method: "PATCH", body: JSON.stringify(payload),
@@ -257,14 +289,18 @@ export default function EmailScheduler({ apiBase }) {
       </header>
 
       <div style={{ border: `1px solid ${configured ? "#bbf7d0" : "#fecaca"}`, background: configured ? "#f0fdf4" : "#fef2f2", borderRadius: 10, padding: 11, marginBottom: 14, overflowWrap: "anywhere" }}>
-        <strong style={{ display: "block", fontSize: 12, marginBottom: 3 }}>{configured ? "Saved recipient" : "Saved recipient not configured"}</strong>
-        <span style={{ fontSize: 13 }}>{recipient || "Set AURA_SAVED_EMAIL in backend/.env and restart the backend."}</span>
+        <strong style={{ display: "block", fontSize: 12, marginBottom: 3 }}>{configured ? "Default saved recipient" : "Default recipient not configured"}</strong>
+        <span style={{ fontSize: 13 }}>
+          {configured
+            ? `Default: ${recipient || "Not set"}. You can change the recipient in the draft below.`
+            : "Set AURA_SAVED_EMAIL in backend/.env for a default recipient, or enter recipient email address(es) in the draft below. The backend must accept the recipient fields."}
+        </span>
       </div>
 
       <form onSubmit={generateDraft} style={{ display: "grid", gap: 8, marginBottom: 16 }}>
         <label htmlFor="aura-email-instruction" style={{ fontSize: 13, fontWeight: 700 }}>What should the email say?</label>
         <textarea id="aura-email-instruction" style={{ ...inputStyle, minHeight: 76, resize: "vertical" }} value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="Example: Write a polite email asking my manager to reschedule tomorrow's meeting." maxLength={2000} />
-        <button type="submit" style={primaryStyle} disabled={drafting || !configured}><Mail size={15} />{drafting ? "Drafting…" : "Generate email draft"}</button>
+        <button type="submit" style={primaryStyle} disabled={drafting}><Mail size={15} />{drafting ? "Drafting…" : "Generate email draft"}</button>
       </form>
 
       {(subject || body || editingId) && (
@@ -273,13 +309,24 @@ export default function EmailScheduler({ apiBase }) {
             <strong>{editingId ? "Edit scheduled email" : savedDraftId ? "Edit saved draft" : "Review your draft"}</strong>
             <button type="button" style={buttonStyle} onClick={clearDraft} title="Clear draft"><X size={14} /> Clear</button>
           </div>
+          <label style={{ fontSize: 13, fontWeight: 700 }} htmlFor="aura-email-recipient">To (email addresses)</label>
+          <input
+            id="aura-email-recipient"
+            style={inputStyle}
+            value={recipient}
+            onChange={(e) => setRecipient(e.target.value)}
+            placeholder="person@example.com, another@example.com"
+            autoComplete="email"
+            required
+          />
+          <small style={{ color: "#6b7280" }}>Enter one or more email addresses separated by commas or semicolons. Review recipients before scheduling.</small>
           <label style={{ fontSize: 13, fontWeight: 700 }} htmlFor="aura-email-subject">Subject</label>
           <input id="aura-email-subject" style={inputStyle} value={subject} onChange={(e) => setSubject(e.target.value)} maxLength={200} required />
           <label style={{ fontSize: 13, fontWeight: 700 }} htmlFor="aura-email-body">Email body</label>
           <textarea id="aura-email-body" style={{ ...inputStyle, minHeight: 150, resize: "vertical", lineHeight: 1.5 }} value={body} onChange={(e) => setBody(e.target.value)} maxLength={10000} required />
           <label style={{ fontSize: 13, fontWeight: 700 }} htmlFor="aura-email-send-at">Send date and time</label>
           <input id="aura-email-send-at" style={inputStyle} type="datetime-local" value={sendAt} min={minSendAt} onChange={(e) => setSendAt(e.target.value)} required />
-          <small style={{ color: "#6b7280" }}>Time zone: {Intl.DateTimeFormat().resolvedOptions().timeZone || "local time"}. The email will be sent to the saved recipient above.</small>
+          <small style={{ color: "#6b7280" }}>Time zone: {Intl.DateTimeFormat().resolvedOptions().timeZone || "local time"}. The email will be sent to the recipient address(es) above.</small>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
             <button type="button" style={buttonStyle} onClick={saveDraft} disabled={saving || !subject.trim() || !body.trim()}><Mail size={15} />{saving ? "Saving…" : savedDraftId ? "Update saved draft" : "Save draft"}</button>
             <button type="submit" style={primaryStyle} disabled={saving || !configured}><CalendarClock size={16} />{saving ? "Saving…" : editingId ? "Save schedule changes" : "Approve and schedule email"}</button>
@@ -301,7 +348,7 @@ export default function EmailScheduler({ apiBase }) {
               <div style={{ minWidth: 0, overflowWrap: "anywhere" }}>
                 <strong style={{ fontSize: 13 }}>{item.subject}</strong>
                 <div style={{ color: "#6b7280", fontSize: 12, marginTop: 4 }}>Updated {showDate(item.updated_at)}</div>
-                {item.recipient && <div style={{ color: "#6b7280", fontSize: 12, marginTop: 3 }}>To: {item.recipient}</div>}
+                {(item.recipients?.length || item.recipient) && <div style={{ color: "#6b7280", fontSize: 12, marginTop: 3 }}>To: {(item.recipients || [item.recipient]).filter(Boolean).join(", ")}</div>}
                 <p style={{ color: "#374151", fontSize: 12, whiteSpace: "pre-wrap", margin: "8px 0 0", maxHeight: 80, overflow: "hidden" }}>{item.body}</p>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
@@ -325,7 +372,7 @@ export default function EmailScheduler({ apiBase }) {
               <div style={{ minWidth: 0, overflowWrap: "anywhere" }}>
                 <strong style={{ fontSize: 13 }}>{item.subject}</strong>
                 <div style={{ color: "#6b7280", fontSize: 12, marginTop: 4 }}>{showDate(item.send_at)}</div>
-                <div style={{ color: "#6b7280", fontSize: 12, marginTop: 3 }}>To: {item.recipient}</div>
+                <div style={{ color: "#6b7280", fontSize: 12, marginTop: 3 }}>To: {(item.recipients || [item.recipient]).filter(Boolean).join(", ") || "Recipient not available"}</div>
                 <p style={{ color: "#374151", fontSize: 12, whiteSpace: "pre-wrap", margin: "8px 0 0" }}>{item.body}</p>
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
